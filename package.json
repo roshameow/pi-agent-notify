@@ -1,0 +1,31 @@
+{
+  "name": "pi-agent-notify",
+  "version": "0.1.0",
+  "description": "Script → agent direct notification channel for pi: external scripts write JSON events to a trigger dir, the extension batches/dedups and injects them into the active agent session as user messages. Identity-aware: subagents with PI_SUBAGENT_TASK_ID listen on their own taskId subdirectory for directed wake-ups.",
+  "keywords": [
+    "pi-package",
+    "notify",
+    "notification",
+    "scripts",
+    "watcher",
+    "subagent-wakeup"
+  ],
+  "type": "commonjs",
+  "main": "extensions/index.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/roshameow/pi-agent-notify.git"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}
