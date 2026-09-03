@@ -1,5 +1,5 @@
 /**
- * agent-notify.ts — 脚本 → 主 agent 直连通知通道（v2：合并缓冲 + 去重）
+ * agent-notify.ts — 脚本 → 主 agent 直连通知通道（v3：按项目/item 路由 + 合并缓冲 + 去重）
  *
  * 背景：TalentsAI 出题流程里大量 watcher 脚本（keepalive/reviewwatch/评测轮询等）
  * 发现问题后只能语音叫你或写 status.log，你需要再手动告诉 agent 处理。
@@ -8,7 +8,7 @@
  *   - 扩展监听目录，合并缓冲后作为"用户消息"注入
  *   - agent 收到后会自动处理（如评测完成→自动去质检/提交/返修）
  *
- * v2 关键改动（修复刷屏）：
+ * v3 关键改动（修复串会话与刷屏）：
  *   1. 合并缓冲：发现事件后攒 15s，同一批合成一条消息注入（不逐条发）
  *   2. 去重缓存：同 key（source+itemId+消息前缀）30 分钟内只注入一次，
  *      避免 keepalive 每 60s 反复报同一事件刷屏
@@ -17,7 +17,7 @@
  * 用法（外部脚本）：
  *   python3 scripts/notify_agent.py "消息文本" --level yellow --source reviewwatch
  *
- * 触发目录：/tmp/pi-agent-notify/  （脚本往这写 *.json，扩展处理后删除）
+ * 触发目录：/tmp/pi-agent-notify/；主 session 使用 main/{sessionId} 专属收件箱，worker 使用 task-{id} 收件箱。
  *
  * level 语义：
  *   green  = 正常推进，注入 agent 备忘（不打扰）
@@ -27,15 +27,30 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const TRIGGER_DIR_BASE = process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify";
-// 身份感知：subagent 用独立的通知子目录（防多会话抢文件）
-// 主 session 无 PI_SUBAGENT_TASK_ID → 用基础目录；subagent → /tmp/pi-agent-notify/{taskId}/
+// 身份感知：subagent 用独立的通知子目录（防多会话抢文件）。
+// 主 session 不能共用基础目录：多个项目/会话会竞争同一个 evt 文件，导致通知串到别的对话。
+// 主 session 的收件箱在 main/{sessionId}，由 notify_agent.py 按 itemId + cwd 路由。
 const SUBAGENT_TASK_ID = process.env.PI_SUBAGENT_TASK_ID || "";
-const TRIGGER_DIR = SUBAGENT_TASK_ID
-	? `${TRIGGER_DIR_BASE}/${SUBAGENT_TASK_ID}`
-	: TRIGGER_DIR_BASE;
+let TRIGGER_DIR = SUBAGENT_TASK_ID ? `${TRIGGER_DIR_BASE}/${SUBAGENT_TASK_ID}` : "";
+let PENDING_SCOPE_DIR = "";
+const MAIN_REGISTRY_DIR = `${TRIGGER_DIR_BASE}/.main-sessions`;
+const MAIN_PENDING_DIR = `${TRIGGER_DIR_BASE}/main-pending`;
+const MAIN_HEARTBEAT_MS = 30_000;
+let sessionRegistryFile = "";
+let sessionHeartbeat: ReturnType<typeof setInterval> | null = null;
+let sessionScope = "";
+let sessionId = "";
+
+function safeSessionKey(value: string): string {
+	return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
+}
+function scopeKey(value: string): string {
+	return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
 const SCAN_INTERVAL_MS = 2000;
 const BATCH_WINDOW_MS = 15000; // 合并缓冲窗口：攒 15s 一次注入
 const DEDUP_COOLDOWN_MS = 30 * 60 * 1000; // 去重冷却 30 分钟
@@ -45,41 +60,92 @@ interface NotifyEvent {
 	source: string;
 	message: string;
 	itemId?: string;
+	ts?: number;
 }
 
 let currentCtx: any = null; // 最近一次 session_start 的 ctx
 let pendingEvents: NotifyEvent[] = []; // 合并缓冲
 let batchTimer: ReturnType<typeof setTimeout> | null = null;
 let dedupCache = new Map<string, number>(); // key -> 上次注入时间戳
+let followUpOutstanding = false; // 全局最多一条已排队 followUp；后续事件留在内存继续合并
+
+function discoverSessionItems(ctx: any): string[] {
+	// 只登记当前项目台账中的 item，避免把普通数字（日期、端口、金额）误当题目。
+	try {
+		const ledgerPath = path.join(ctx.cwd, "docs", "current_tasks.json");
+		const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf-8"));
+		const known = new Set(Object.keys(ledger.items || {}).filter((x) => /^\d+$/.test(x)));
+		const entries = ctx.sessionManager?.getEntries?.() || [];
+		const text = JSON.stringify(entries);
+		return [...known].filter((id) => new RegExp(`(?:^|\\D)${id}(?:$|\\D)`).test(text));
+	} catch (_) {
+		return [];
+	}
+}
+
+function writeSessionRegistration(ctx: any): void {
+	if (SUBAGENT_TASK_ID || !sessionRegistryFile) return;
+	try {
+		const record = {
+			sessionId,
+			pid: process.pid,
+			cwd: sessionScope,
+			sessionFile: ctx.sessionManager?.getSessionFile?.() || null,
+			inbox: TRIGGER_DIR,
+			items: discoverSessionItems(ctx),
+			heartbeat: Date.now(),
+		};
+		const tmp = `${sessionRegistryFile}.${process.pid}.tmp`;
+		fs.mkdirSync(MAIN_REGISTRY_DIR, { recursive: true });
+		fs.writeFileSync(tmp, JSON.stringify(record), "utf-8");
+		fs.renameSync(tmp, sessionRegistryFile);
+	} catch (e) {
+		try {
+			fs.appendFileSync("/tmp/agent-notify.log", `[${new Date().toISOString()}] session registration err ${e}\n`);
+		} catch (_) { /* ignore */ }
+	}
+}
+
+function removeSessionRegistration(): void {
+	if (sessionHeartbeat) {
+		clearInterval(sessionHeartbeat);
+		sessionHeartbeat = null;
+	}
+	if (sessionRegistryFile) {
+		try { fs.rmSync(sessionRegistryFile, { force: true }); } catch (_) { /* ignore */ }
+	}
+	sessionRegistryFile = "";
+}
 
 export default function (pi: ExtensionAPI) {
 	let scanTimer: ReturnType<typeof setInterval> | null = null;
 
 	// 启动监听（session 开始时）
 	pi.on("session_start", async (_event, ctx) => {
-		try {
-			fs.mkdirSync(TRIGGER_DIR, { recursive: true });
-		} catch (e) {
-			/* ignore */
+		if (!SUBAGENT_TASK_ID) {
+			sessionId = String(ctx.sessionManager?.getSessionId?.() || process.pid);
+			sessionScope = path.resolve(ctx.cwd);
+			const key = safeSessionKey(sessionId);
+			TRIGGER_DIR = path.join(TRIGGER_DIR_BASE, "main", key);
+			PENDING_SCOPE_DIR = path.join(MAIN_PENDING_DIR, scopeKey(sessionScope));
+			sessionRegistryFile = path.join(MAIN_REGISTRY_DIR, `${key}.json`);
+			writeSessionRegistration(ctx);
+			sessionHeartbeat = setInterval(() => writeSessionRegistration(ctx), MAIN_HEARTBEAT_MS);
+			sessionHeartbeat.unref?.();
+		}
+		const watchDirs = [TRIGGER_DIR, ...(!SUBAGENT_TASK_ID && PENDING_SCOPE_DIR ? [PENDING_SCOPE_DIR] : [])];
+		for (const dir of watchDirs) {
+			try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* ignore */ }
 		}
 
-		// fs.watch 作为第一通道
-		try {
-			const watcher = fs.watch(TRIGGER_DIR, () => {
-				scheduleFlush().catch((e) => piLog(`watch err ${e}`));
-			});
-			watcher.on("error", () => {
-				/* 目录被删等情况，定时轮询兜底 */
-			});
-			pi.on("session_shutdown", () => {
-				try {
-					watcher.close();
-				} catch (e) {
-					/* ignore */
-				}
-			});
-		} catch (e) {
-			piLog(`watch setup err ${e}`);
+		// fs.watch 作为第一通道；无活跃主会话时的 scope pending 也会在启动后消费。
+		const dirWatchers: fs.FSWatcher[] = [];
+		for (const dir of watchDirs) {
+			try {
+				const watcher = fs.watch(dir, () => scheduleFlush().catch((e) => piLog(`watch err ${e}`)));
+				watcher.on("error", () => { /* 定时轮询兜底 */ });
+				dirWatchers.push(watcher);
+			} catch (e) { piLog(`watch setup err ${dir}: ${e}`); }
 		}
 
 		// 定时轮询兜底（fs.watch 在 macOS 目录场景可能漏事件）
@@ -92,8 +158,35 @@ export default function (pi: ExtensionAPI) {
 
 		currentCtx = ctx;
 		if (ctx.hasUI) {
-			ctx.ui.notify(`agent-notify v2: watching ${TRIGGER_DIR}`, "info");
+			ctx.ui.notify(`agent-notify v3: watching ${TRIGGER_DIR}`, "info");
 		}
+
+		// reload/new/resume 会销毁旧 session runtime。清理旧 timer 很重要：
+		// 否则旧 timer 会继续调用旧 pi.sendUserMessage，触发 stale ctx，导致通知丢失。
+		pi.on("session_shutdown", () => {
+			for (const watcher of dirWatchers) {
+				try { watcher.close(); } catch (_) { /* ignore */ }
+			}
+			if (scanTimer) {
+				clearInterval(scanTimer);
+				scanTimer = null;
+			}
+			if (batchTimer) {
+				clearTimeout(batchTimer);
+				batchTimer = null;
+			}
+			removeSessionRegistration();
+			// reload/shutdown 时把尚未注入的内存事件写回 scope/worker inbox，避免静默丢失。
+			const retryDir = (!SUBAGENT_TASK_ID && PENDING_SCOPE_DIR) ? PENDING_SCOPE_DIR : TRIGGER_DIR;
+			for (const event of pendingEvents) {
+				try {
+					fs.mkdirSync(retryDir, { recursive: true });
+					fs.writeFileSync(path.join(retryDir, `evt-requeue-${Date.now()}-${Math.random().toString(16).slice(2)}.json`), JSON.stringify(event), "utf-8");
+				} catch (_) { /* leave shutdown best-effort */ }
+			}
+			pendingEvents = [];
+			currentCtx = null;
+		});
 	});
 
 	function piLog(msg: string) {
@@ -124,36 +217,29 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// 读触发目录新文件，加入合并缓冲（原子 rename，避免并发）
+	// 读专属 inbox 与 scope pending，加入合并缓冲（原子 rename，避免并发）。
 	async function collectFiles() {
-		let files: string[];
-		try {
-			files = fs.readdirSync(TRIGGER_DIR).filter((f) => f.endsWith(".json"));
-		} catch (e) {
-			return;
-		}
-		if (files.length === 0) return;
-		for (const f of files) {
-			const full = path.join(TRIGGER_DIR, f);
-			const proc = full + ".processing";
-			try {
-				fs.renameSync(full, proc);
-				const raw = fs.readFileSync(proc, "utf-8");
-				fs.rmSync(proc, { force: true });
-				const obj = JSON.parse(raw);
-				if (obj && (obj.message || obj.text)) {
-					pendingEvents.push({
-						level: obj.level || "yellow",
-						source: obj.source || "script",
-						message: obj.message || obj.text,
-						itemId: obj.itemId || undefined,
-					});
-				}
-			} catch (e) {
+		const dirs = [TRIGGER_DIR, ...(!SUBAGENT_TASK_ID && PENDING_SCOPE_DIR ? [PENDING_SCOPE_DIR] : [])];
+		for (const dir of dirs) {
+			let files: string[];
+			try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")); }
+			catch (_) { continue; }
+			for (const f of files) {
+				const full = path.join(dir, f);
+				const proc = full + ".processing";
 				try {
+					fs.renameSync(full, proc);
+					const raw = fs.readFileSync(proc, "utf-8");
+					const obj = JSON.parse(raw);
+					if (obj && (obj.message || obj.text)) {
+						pendingEvents.push({ level: obj.level || "yellow", source: obj.source || "script",
+							message: obj.message || obj.text, itemId: obj.itemId || undefined,
+							ts: typeof obj.ts === "number" ? obj.ts : undefined });
+					}
 					fs.rmSync(proc, { force: true });
-				} catch (e2) {
-					/* ignore */
+				} catch (e) {
+					// rename 成功但读取/解析失败时保留 .processing 供人工审计，不静默删除。
+					piLog(`collect failed ${proc}: ${e}`);
 				}
 			}
 		}
@@ -161,11 +247,29 @@ export default function (pi: ExtensionAPI) {
 
 	// 去重 key：source + itemId + 消息前 40 字符（同类事件视为重复）
 	function dedupKey(e: NotifyEvent): string {
-		const base = `${e.source}|${e.itemId || "-"}|${e.message.slice(0, 40)}`;
-		return base;
+		// red 按 item+状态消息跨 watcher 去重，避免不同检测器对同一人工阻塞重复注入。
+		const source = e.level === "red" ? "*" : e.source;
+		return `${source}|${e.itemId || "-"}|${e.message.slice(0, 40)}`;
 	}
 
-	// 合并缓冲到期：去重 → 合成一条 → 注入
+	// 录屏告警是瞬时状态：事件排队期间若健康快照已恢复，不应再注入一条过期红警。
+	function isObsoleteRecordingAlert(e: NotifyEvent, now: number): boolean {
+		if (e.source !== "recording_supervisor" || e.level !== "red") return false;
+		const eventMs = e.ts ? (e.ts < 10_000_000_000 ? e.ts * 1000 : e.ts) : 0;
+		if (eventMs && now - eventMs > 3 * 60 * 1000) return true;
+		if (!e.itemId || !currentCtx?.cwd) return false;
+		try {
+			const p = path.join(currentCtx.cwd, "docs", "recording_health.json");
+			const h = JSON.parse(fs.readFileSync(p, "utf-8"));
+			const generated = Date.parse(h.generatedAt || "");
+			const inst = h.instances?.[String(e.itemId)];
+			return Number.isFinite(generated) && now - generated < 120_000 && inst?.state === "running";
+		} catch (_) {
+			return false;
+		}
+	}
+
+	// 合并缓冲到期：丢弃过期状态 → 去重 → 合成一条 → 注入
 	async function flushBatch() {
 		if (pendingEvents.length === 0) return;
 		const batch = pendingEvents;
@@ -175,16 +279,18 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		const unique: NotifyEvent[] = [];
 		for (const e of batch) {
+			if (isObsoleteRecordingAlert(e, now)) {
+				piLog(`stale recording alert skip ${e.itemId || "-"}: ${e.message.slice(0, 80)}`);
+				continue;
+			}
 			const key = dedupKey(e);
 			const last = dedupCache.get(key) || 0;
 			if (now - last < DEDUP_COOLDOWN_MS) {
 				piLog(`dedup skip ${key.slice(0, 80)}`);
 				continue;
 			}
-			// red 永不合并去重（每次都报）；green/yellow 才去重
-			if (e.level !== "red") {
-				dedupCache.set(key, now);
-			}
+			// red 同样必须去重；真正的新状态由消息前缀/状态类形成不同 key。
+			dedupCache.set(key, now);
 			unique.push(e);
 		}
 		if (unique.length === 0) return;
@@ -198,22 +304,34 @@ export default function (pi: ExtensionAPI) {
 		const text = parts.join("\n");
 		const body = `[脚本通知] ${text}\n\n（来自自动监控脚本，请判断是否需要处理并自行推进，无需告知用户；若需用户拍板则红色提醒。）`;
 
+		let injected = false;
 		try {
 			if (currentCtx?.isIdle && currentCtx.isIdle()) {
+				followUpOutstanding = false;
 				pi.sendUserMessage(body);
 				piLog(`injected(${unique.length}条合并): ${text.slice(0, 120)}`);
-			} else {
-				// busy：只排一条 followUp（合并后），不逐条排队
+			} else if (!followUpOutstanding) {
+				// busy：全局只允许一条已排队 followUp。
 				pi.sendUserMessage(body, { deliverAs: "followUp" });
+				followUpOutstanding = true;
 				piLog(`injected(followUp,${unique.length}条合并): ${text.slice(0, 120)}`);
+			} else {
+				// 已有 followUp 等待消费：撤销 dedup 占位并留在内存，继续与后续事件合并。
+				for (const event of unique) dedupCache.delete(dedupKey(event));
+				pendingEvents.unshift(...unique);
+				piLog(`followUp already outstanding; retained ${unique.length} event(s)`);
+				return;
 			}
+			injected = true;
 		} catch (e) {
-			// 注入失败：把事件放回缓冲尾，下轮再试（但防无限重试，最多保留）
-			piLog(`inject failed: ${e}`);
+			// 注入失败：撤销本轮 dedup 占位并放回缓冲，下一轮重试。
+			for (const event of unique) dedupCache.delete(dedupKey(event));
+			pendingEvents.unshift(...unique);
+			piLog(`inject failed; requeued ${unique.length}: ${e}`);
 		}
 
-		// red 事件额外 TUI 高亮
-		if (unique.some((e) => e.level === "red")) {
+		// red 事件仅在成功注入后额外 TUI 高亮；主会话语音由 sender 去重后负责。
+		if (injected && unique.some((e) => e.level === "red")) {
 			try {
 				if (currentCtx?.ui) currentCtx.ui.notify("🔴 脚本事件需用户拍板（见对话）", "error");
 			} catch (e) {
