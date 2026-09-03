@@ -27,7 +27,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const TRIGGER_DIR_BASE = process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify";
@@ -51,9 +51,12 @@ function safeSessionKey(value: string): string {
 function scopeKey(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
-const SCAN_INTERVAL_MS = 2000;
-const BATCH_WINDOW_MS = 15000; // 合并缓冲窗口：攒 15s 一次注入
+const SCAN_INTERVAL_MS = Math.max(50, Number(process.env.PI_AGENT_NOTIFY_SCAN_MS || 2000));
+const BATCH_WINDOW_MS = Math.max(0, Number(process.env.PI_AGENT_NOTIFY_BATCH_MS || 15000)); // 合并缓冲窗口：默认攒 15s
 const DEDUP_COOLDOWN_MS = 30 * 60 * 1000; // 去重冷却 30 分钟
+const WAIT_LEASE_FILE = ".notification-wait-lease";
+const MIN_WAIT_LEASE_SECONDS = 30;
+const MAX_WAIT_LEASE_SECONDS = 24 * 60 * 60;
 
 interface NotifyEvent {
 	level: string;
@@ -63,11 +66,80 @@ interface NotifyEvent {
 	ts?: number;
 }
 
+interface WaitLease {
+	version: 1;
+	leaseId: string;
+	taskId: string;
+	itemId: string;
+	reason: string;
+	wakeCondition: string;
+	checkpointPath?: string;
+	cwd: string;
+	pid: number;
+	armedAt: number;
+	expiresAt: number;
+}
+
 let currentCtx: any = null; // 最近一次 session_start 的 ctx
 let pendingEvents: NotifyEvent[] = []; // 合并缓冲
 let batchTimer: ReturnType<typeof setTimeout> | null = null;
 let dedupCache = new Map<string, number>(); // key -> 上次注入时间戳
 let followUpOutstanding = false; // 全局最多一条已排队 followUp；后续事件留在内存继续合并
+let activeWaitLease: WaitLease | null = null;
+let waitLeaseResolve: (() => void) | null = null;
+let waitLeaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+function waitLeasePath(): string {
+	return path.join(TRIGGER_DIR, WAIT_LEASE_FILE);
+}
+
+function readWorkerRegistration(taskId: string): any | null {
+	try {
+		const registry = JSON.parse(fs.readFileSync(path.join(TRIGGER_DIR_BASE, ".active-workers.json"), "utf-8"));
+		return registry?.workers?.[taskId] || null;
+	} catch (_) {
+		return null;
+	}
+}
+
+function removeWaitLeaseFile(): void {
+	try { fs.rmSync(waitLeasePath(), { force: true }); } catch (_) { /* ignore */ }
+}
+
+function readWaitLease(): WaitLease | null {
+	if (!SUBAGENT_TASK_ID) return null;
+	try {
+		const value = JSON.parse(fs.readFileSync(waitLeasePath(), "utf-8"));
+		const valid = value?.version === 1
+			&& value?.taskId === SUBAGENT_TASK_ID
+			&& /^\d{6}$/.test(String(value?.itemId || ""))
+			&& Number.isFinite(value?.expiresAt)
+			&& value.expiresAt > Date.now();
+		if (!valid) {
+			removeWaitLeaseFile();
+			return null;
+		}
+		return value as WaitLease;
+	} catch (e: any) {
+		if (e?.code !== "ENOENT") removeWaitLeaseFile();
+		return null;
+	}
+}
+
+function clearWaitLease(reason: string): void {
+	if (waitLeaseTimer) {
+		clearTimeout(waitLeaseTimer);
+		waitLeaseTimer = null;
+	}
+	removeWaitLeaseFile();
+	activeWaitLease = null;
+	const resolve = waitLeaseResolve;
+	waitLeaseResolve = null;
+	if (resolve) resolve();
+	try {
+		fs.appendFileSync("/tmp/agent-notify.log", `[${new Date().toISOString()}] wait lease released task=${SUBAGENT_TASK_ID || "main"} reason=${reason}\n`);
+	} catch (_) { /* ignore */ }
+}
 
 function discoverSessionItems(ctx: any): string[] {
 	// 只登记当前项目台账中的 item，避免把普通数字（日期、端口、金额）误当题目。
@@ -120,8 +192,97 @@ function removeSessionRegistration(): void {
 export default function (pi: ExtensionAPI) {
 	let scanTimer: ReturnType<typeof setInterval> | null = null;
 
+	if (SUBAGENT_TASK_ID) {
+		pi.registerTool({
+			name: "arm_notification_wait",
+			label: "Arm notification wait",
+			description: "Arm a bounded system-level wait lease for this durable worker after starting one external watcher. The current turn may then finish; agent-notify keeps the same worker process alive and a directed notify_agent.py event resumes it. This does not poll or start a watcher.",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				required: ["itemId", "reason", "wakeCondition"],
+				properties: {
+					itemId: { type: "string", pattern: "^[0-9]{6}$", description: "Exact six-digit item owned by this worker" },
+					reason: { type: "string", minLength: 1, maxLength: 300, description: "Why the worker must stay alive" },
+					wakeCondition: { type: "string", minLength: 1, maxLength: 500, description: "Exact external event/state that should wake the worker" },
+					leaseSeconds: { type: "integer", minimum: MIN_WAIT_LEASE_SECONDS, maximum: MAX_WAIT_LEASE_SECONDS, default: 21600 },
+					checkpointPath: { type: "string", maxLength: 500, description: "Repository checkpoint/marker to re-read after wake" },
+				},
+			} as any,
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				const itemId = String(params.itemId || "");
+				const existingLease = activeWaitLease || readWaitLease();
+				if (existingLease) {
+					return {
+						content: [{ type: "text", text: `REFUSED: worker ${SUBAGENT_TASK_ID} already has active wait lease ${existingLease.leaseId} for item ${existingLease.itemId}` }],
+						details: { armed: false, existingLease },
+					};
+				}
+				const registration = readWorkerRegistration(SUBAGENT_TASK_ID);
+				const registeredItems = Array.isArray(registration?.itemIds) ? registration.itemIds.map(String) : [];
+				if (!registration || !registeredItems.includes(itemId)) {
+					return {
+						content: [{ type: "text", text: `REFUSED: item ${itemId} is not owned by active worker ${SUBAGENT_TASK_ID}` }],
+						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, registeredItems },
+					};
+				}
+				if (path.resolve(registration.cwd || "") !== path.resolve(ctx.cwd)) {
+					return {
+						content: [{ type: "text", text: `REFUSED: worker cwd mismatch for ${SUBAGENT_TASK_ID}` }],
+						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
+					};
+				}
+				const leaseSeconds = Number(params.leaseSeconds || 21600);
+				if (!Number.isInteger(leaseSeconds) || leaseSeconds < MIN_WAIT_LEASE_SECONDS || leaseSeconds > MAX_WAIT_LEASE_SECONDS) {
+					return {
+						content: [{ type: "text", text: `REFUSED: leaseSeconds must be an integer from ${MIN_WAIT_LEASE_SECONDS} to ${MAX_WAIT_LEASE_SECONDS}` }],
+						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
+					};
+				}
+				let checkpointPath: string | undefined;
+				if (params.checkpointPath) {
+					checkpointPath = path.resolve(ctx.cwd, String(params.checkpointPath));
+					const rel = path.relative(path.resolve(ctx.cwd), checkpointPath);
+					if (rel.startsWith("..") || path.isAbsolute(rel)) {
+						return {
+							content: [{ type: "text", text: `REFUSED: checkpointPath must stay under worker cwd ${path.resolve(ctx.cwd)}` }],
+							details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
+						};
+					}
+				}
+				const now = Date.now();
+				const lease: WaitLease = {
+					version: 1,
+					leaseId: randomUUID(),
+					taskId: SUBAGENT_TASK_ID,
+					itemId,
+					reason: String(params.reason),
+					wakeCondition: String(params.wakeCondition),
+					checkpointPath,
+					cwd: path.resolve(ctx.cwd),
+					pid: process.pid,
+					armedAt: now,
+					expiresAt: now + leaseSeconds * 1000,
+				};
+				fs.mkdirSync(TRIGGER_DIR, { recursive: true });
+				const tmp = `${waitLeasePath()}.${process.pid}.tmp`;
+				fs.writeFileSync(tmp, JSON.stringify(lease), { encoding: "utf-8", mode: 0o600 });
+				fs.renameSync(tmp, waitLeasePath());
+				activeWaitLease = lease;
+				piLog(`wait lease armed task=${SUBAGENT_TASK_ID} item=${itemId} lease=${lease.leaseId} seconds=${leaseSeconds}`);
+				return {
+					content: [{ type: "text", text: `ARMED: ${SUBAGENT_TASK_ID} remains alive for directed notifications about item ${itemId} until ${new Date(lease.expiresAt).toISOString()}. Finish this turn without foreground sleep/polling; the extension will hold the worker at agent_end.` }],
+					details: { armed: true, ...lease },
+				};
+			},
+		});
+	}
+
 	// 启动监听（session 开始时）
 	pi.on("session_start", async (_event, ctx) => {
+		// Restore only a structurally valid, unexpired lease for this exact task.
+		// readWaitLease removes malformed/expired leftovers from a prior crash.
+		if (SUBAGENT_TASK_ID) activeWaitLease = readWaitLease();
 		if (!SUBAGENT_TASK_ID) {
 			sessionId = String(ctx.sessionManager?.getSessionId?.() || process.pid);
 			sessionScope = path.resolve(ctx.cwd);
@@ -164,6 +325,9 @@ export default function (pi: ExtensionAPI) {
 		// reload/new/resume 会销毁旧 session runtime。清理旧 timer 很重要：
 		// 否则旧 timer 会继续调用旧 pi.sendUserMessage，触发 stale ctx，导致通知丢失。
 		pi.on("session_shutdown", () => {
+			if (activeWaitLease || (SUBAGENT_TASK_ID && fs.existsSync(waitLeasePath()))) {
+				clearWaitLease("session_shutdown");
+			}
 			for (const watcher of dirWatchers) {
 				try { watcher.close(); } catch (_) { /* ignore */ }
 			}
@@ -185,7 +349,66 @@ export default function (pi: ExtensionAPI) {
 				} catch (_) { /* leave shutdown best-effort */ }
 			}
 			pendingEvents = [];
+			if (waitLeaseTimer) {
+				clearTimeout(waitLeaseTimer);
+				waitLeaseTimer = null;
+			}
+			waitLeaseResolve = null;
+			activeWaitLease = null;
 			currentCtx = null;
+		});
+	});
+
+	// A queued follow-up has actually been consumed only when a new agent run
+	// starts. Resetting at send time is too early; never resetting leaves later
+	// events stuck behind "followUp already outstanding" forever.
+	pi.on("agent_start", async () => {
+		if (!followUpOutstanding) return;
+		followUpOutstanding = false;
+		piLog(`followUp consumed; queue reopened task=${SUBAGENT_TASK_ID || "main"}`);
+		if (pendingEvents.length > 0) scheduleFlush().catch((e) => piLog(`post-consume flush err ${e}`));
+	});
+
+	// Durable workers run as `pi --mode json -p` and otherwise exit immediately
+	// after agent_settled. Hold agent_end (before settled is emitted) only when
+	// this worker explicitly armed a bounded lease. A directed event is queued
+	// as a follow-up, then releases this handler so the same session continues.
+	pi.on("agent_end", async () => {
+		if (!SUBAGENT_TASK_ID) return;
+		try {
+			await collectFiles();
+			if (pendingEvents.length > 0 && !followUpOutstanding) {
+				if (batchTimer) {
+					clearTimeout(batchTimer);
+					batchTimer = null;
+				}
+				await flushBatch();
+			}
+		} catch (e) {
+			piLog(`agent_end preflush err ${e}`);
+		}
+		const lease = activeWaitLease || readWaitLease();
+		if (!lease || followUpOutstanding) return;
+		activeWaitLease = lease;
+		const remaining = lease.expiresAt - Date.now();
+		if (remaining <= 0) {
+			clearWaitLease("expired_before_hold");
+			return;
+		}
+		piLog(`wait lease holding task=${SUBAGENT_TASK_ID} item=${lease.itemId} lease=${lease.leaseId}`);
+		await new Promise<void>((resolve) => {
+			waitLeaseResolve = resolve;
+			waitLeaseTimer = setTimeout(() => {
+				const body = `[脚本通知] 🟡[agent-notify] [item ${lease.itemId}] 等待租约已到期。请重新读取权威状态与 ${lease.checkpointPath || "checkpoint"}，决定续等、推进或上报；不要前台 sleep/轮询。`;
+				try {
+					pi.sendUserMessage(body, { deliverAs: "followUp" });
+					followUpOutstanding = true;
+					clearWaitLease("lease_timeout_followup");
+				} catch (e) {
+					piLog(`lease timeout injection failed ${e}`);
+					clearWaitLease("lease_timeout_inject_failed");
+				}
+			}, remaining);
 		});
 	});
 
@@ -307,7 +530,6 @@ export default function (pi: ExtensionAPI) {
 		let injected = false;
 		try {
 			if (currentCtx?.isIdle && currentCtx.isIdle()) {
-				followUpOutstanding = false;
 				pi.sendUserMessage(body);
 				piLog(`injected(${unique.length}条合并): ${text.slice(0, 120)}`);
 			} else if (!followUpOutstanding) {
@@ -323,6 +545,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			injected = true;
+			if (SUBAGENT_TASK_ID && (activeWaitLease || readWaitLease())) clearWaitLease("directed_event_injected");
 		} catch (e) {
 			// 注入失败：撤销本轮 dedup 占位并放回缓冲，下一轮重试。
 			for (const event of unique) dedupCache.delete(dedupKey(event));

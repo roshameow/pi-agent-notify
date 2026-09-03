@@ -14,7 +14,8 @@ Long-running automation (e.g. TalentsAI 出题流水线) has many background wat
 | **Dedup cache** | green/yellow use source+itemId+message prefix; red ignores source for cross-watcher dedup. Same state is injected at most once per 30min |
 | **Level semantics** | `green` = progress memo · `yellow` = agent-handleable event (default) · `red` = needs user decision (TUI highlight + macOS voice for main-session alerts; still deduped to prevent repeated stale alerts) |
 | **Identity-aware** | Each main session has an inbox under `/tmp/pi-agent-notify/main/{sessionId}/`; when no main session is live, events stay in `main-pending/{cwdHash}/`. Subagents listen on `/tmp/pi-agent-notify/{taskId}/` |
-| **Busy-safe** | Globally at most one `followUp` is queued while busy; later events remain buffered and merge until the agent is idle |
+| **Busy-safe** | Globally at most one `followUp` is queued while busy; `agent_start` marks that follow-up consumed and reopens the queue, preventing a stale outstanding flag from buffering events forever |
+| **Durable wait lease** | A subagent can call `arm_notification_wait`; the extension holds `agent_end` before `agent_settled`, so `pi --mode json -p` stays alive without a foreground sleep/poller. A directed event consumes the lease and resumes the same session |
 
 ## Install
 
@@ -36,8 +37,9 @@ Write a JSON file to the trigger dir:
 python3 scripts/notify_agent.py "evaluation done for item 167161" --level yellow --source evaluation --item 167161
 python3 scripts/notify_agent.py "recording disconnected, please restore" --level red --source recwatch --item 174366
 
-# directed to a specific subagent (方案C 闭环): writes to /tmp/pi-agent-notify/task-<id>/
-python3 scripts/notify_agent.py "v6 models ready, continue grading" --to mtj6zcy5-x0k9 --level yellow
+# directed to a specific subagent: item must match its active-worker ownership
+python3 scripts/notify_agent.py "v6 models ready, continue grading" \
+  --item 168373 --to task-mtj6zcy5-x0k9 --level yellow
 ```
 
 Event file shape (written by scripts):
@@ -55,11 +57,31 @@ Event file shape (written by scripts):
 
 The channel is bidirectional, but each session has its own directory:
 
-- Main session → worker: `notify_agent.py --to <taskId> "msg"` writes to `/tmp/pi-agent-notify/task-<taskId>/`.
+- Main session → worker: `notify_agent.py --item <ownedItem> --to <taskId> "msg"` writes to `/tmp/pi-agent-notify/<taskId>/`. A present durable registry is checked fail-closed: an item/worker ownership mismatch is refused.
 - Worker → main session: omit `--to`; the event is routed by `cwd + itemId` to the matching main-session inbox. If no matching session is live, it is durably queued under `main-pending/{cwdHash}/` for the next matching session.
 - Worker → itself: use `--to "$PI_SUBAGENT_TASK_ID"`; this does **not** appear in the main session.
 
-A directed notification is consumed only while the target pi process is alive and has this extension loaded. `subagent_reload` is a control/resume operation, not a worker-to-main return channel. If a subagent process does not load project extensions, it must use the documented `notify_check.py` fallback; otherwise the extension consumes the event automatically.
+### Keep an unfinished worker alive without foreground waiting
+
+A durable worker launched as `pi --mode json -p` normally exits after `agent_settled`. For an unfinished workflow that must continue after an external state change:
+
+1. Start exactly one bounded external watcher. It must send a directed event with the exact `--item` and current `--to "$PI_SUBAGENT_TASK_ID"` and persist its marker/log outside `/tmp`.
+2. Verify the watcher PID/launch marker, then call the `arm_notification_wait` tool with `itemId`, a precise `wakeCondition`, a bounded `leaseSeconds`, and the checkpoint path.
+3. Finish the current model turn normally. Do not hold a Bash tool call with `sleep`, polling, or `wait_for_change`.
+4. The extension's async `agent_end` handler keeps the process and active-worker registration alive. When the inbox event arrives, it queues one follow-up, removes the lease, releases `agent_end`, and the same session continues.
+5. The next `agent_start` clears the outstanding-follow-up gate. If the worker still needs an external wait after processing, it must re-check authoritative state and explicitly arm a new lease.
+
+The lease file is `/tmp/pi-agent-notify/<taskId>/.notification-wait-lease`. It is bounded to 30 seconds–24 hours. Expiry injects a self-check follow-up rather than silently declaring success. Terminal/delivered workers must not arm a lease; they should exit and unregister normally.
+
+A directed notification is consumed only while the target pi process is alive and has this extension loaded. `subagent_reload` is a control/resume operation, not a worker-to-main return channel. If a subagent process does not load project extensions, it must use the documented fallback; otherwise the extension consumes the event automatically.
+
+## Development
+
+```bash
+npm run check
+```
+
+The test bundles the extension and verifies: stale-lease cleanup, explicit arm, duplicate/path/item rejection, unresolved `agent_end`, directed follow-up wake, lease consumption, `agent_start` queue reopening, and shutdown cleanup.
 
 ## Logging
 
