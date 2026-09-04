@@ -66,7 +66,7 @@ The channel is bidirectional, but each session has its own directory:
 A durable worker launched as `pi --mode json -p` normally exits after `agent_settled`. For an unfinished workflow that must continue after an external state change:
 
 1. Start exactly one bounded external watcher. It must send a directed event with the exact `--item` and current `--to "$PI_SUBAGENT_TASK_ID"` and persist its marker/log outside `/tmp`.
-2. Verify the watcher PID/launch marker, then call the `arm_notification_wait` tool with `itemId`, a precise `wakeCondition`, a bounded `leaseSeconds`, and the checkpoint path.
+2. Verify the watcher PID/launch marker, then call `arm_notification_wait` with `itemId`, a precise `wakeCondition`, bounded `leaseSeconds`, the checkpoint path, `producerPid`, and the existing repository `producerMarkerPath`. The tool rejects a missing/dead producer, so a lease cannot silently become a watcher-free wait.
 3. Finish the current model turn normally. Do not hold a Bash tool call with `sleep`, polling, or `wait_for_change`.
 4. The extension's async `agent_end` handler keeps the process and active-worker registration alive. When the inbox event arrives, it queues one follow-up, removes the lease, releases `agent_end`, and the same session continues.
 5. The next `agent_start` clears the outstanding-follow-up gate. If the worker still needs an external wait after processing, it must re-check authoritative state and explicitly arm a new lease.

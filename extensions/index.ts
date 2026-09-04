@@ -74,6 +74,8 @@ interface WaitLease {
 	reason: string;
 	wakeCondition: string;
 	checkpointPath?: string;
+	producerPid: number;
+	producerMarkerPath: string;
 	cwd: string;
 	pid: number;
 	armedAt: number;
@@ -110,11 +112,26 @@ function readWaitLease(): WaitLease | null {
 	if (!SUBAGENT_TASK_ID) return null;
 	try {
 		const value = JSON.parse(fs.readFileSync(waitLeasePath(), "utf-8"));
+		let producerAlive = false;
+		try {
+			producerAlive = Number.isInteger(value?.producerPid)
+				&& value.producerPid >= 2
+				&& typeof value?.producerMarkerPath === "string"
+				&& fs.existsSync(value.producerMarkerPath);
+			if (producerAlive) {
+				const marker = JSON.parse(fs.readFileSync(value.producerMarkerPath, "utf-8"));
+				producerAlive = Number(marker?.pid) === Number(value.producerPid)
+					&& String(marker?.itemId ?? marker?.item ?? "") === String(value.itemId)
+					&& String(marker?.notifyTo ?? marker?.to ?? "") === String(value.taskId);
+			}
+			if (producerAlive) process.kill(value.producerPid, 0);
+		} catch { producerAlive = false; }
 		const valid = value?.version === 1
 			&& value?.taskId === SUBAGENT_TASK_ID
 			&& /^\d{6}$/.test(String(value?.itemId || ""))
 			&& Number.isFinite(value?.expiresAt)
-			&& value.expiresAt > Date.now();
+			&& value.expiresAt > Date.now()
+			&& producerAlive;
 		if (!valid) {
 			removeWaitLeaseFile();
 			return null;
@@ -200,19 +217,35 @@ export default function (pi: ExtensionAPI) {
 			parameters: {
 				type: "object",
 				additionalProperties: false,
-				required: ["itemId", "reason", "wakeCondition"],
+				required: ["itemId", "reason", "wakeCondition", "producerPid", "producerMarkerPath"],
 				properties: {
 					itemId: { type: "string", pattern: "^[0-9]{6}$", description: "Exact six-digit item owned by this worker" },
 					reason: { type: "string", minLength: 1, maxLength: 300, description: "Why the worker must stay alive" },
 					wakeCondition: { type: "string", minLength: 1, maxLength: 500, description: "Exact external event/state that should wake the worker" },
 					leaseSeconds: { type: "integer", minimum: MIN_WAIT_LEASE_SECONDS, maximum: MAX_WAIT_LEASE_SECONDS, default: 21600 },
 					checkpointPath: { type: "string", maxLength: 500, description: "Repository checkpoint/marker to re-read after wake" },
+					producerPid: { type: "integer", minimum: 2, description: "PID of the unique detached watcher/notifier" },
+					producerMarkerPath: { type: "string", minLength: 1, maxLength: 500, description: "Existing repository launch marker proving watcher identity" },
 				},
 			} as any,
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				const itemId = String(params.itemId || "");
-				const existingLease = activeWaitLease || readWaitLease();
+				// Always revalidate the durable lease and its producer. An in-memory
+				// lease whose watcher died must not be returned as ALREADY_ARMED.
+				const existingLease = readWaitLease();
+				activeWaitLease = existingLease;
 				if (existingLease) {
+					// Idempotent re-arm: a worker may receive a duplicate/coalesced event
+					// while its original lease is still held. Treat the same task+item lease
+					// as success, otherwise workers can mistake a harmless duplicate for a
+					// fatal wait failure and exit before the next external event.
+					if (existingLease.taskId === SUBAGENT_TASK_ID && existingLease.itemId === itemId) {
+						activeWaitLease = existingLease;
+						return {
+							content: [{ type: "text", text: `ALREADY_ARMED: worker ${SUBAGENT_TASK_ID} already holds wait lease ${existingLease.leaseId} for item ${itemId}; finish this turn without foreground sleep/polling.` }],
+							details: { armed: true, alreadyArmed: true, ...existingLease },
+						};
+					}
 					return {
 						content: [{ type: "text", text: `REFUSED: worker ${SUBAGENT_TASK_ID} already has active wait lease ${existingLease.leaseId} for item ${existingLease.itemId}` }],
 						details: { armed: false, existingLease },
@@ -239,16 +272,52 @@ export default function (pi: ExtensionAPI) {
 						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
 					};
 				}
+				const resolveRepoPath = (raw: unknown, label: string): string | null => {
+					const resolved = path.resolve(ctx.cwd, String(raw || ""));
+					const rel = path.relative(path.resolve(ctx.cwd), resolved);
+					if (!raw || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+					return resolved;
+				};
 				let checkpointPath: string | undefined;
 				if (params.checkpointPath) {
-					checkpointPath = path.resolve(ctx.cwd, String(params.checkpointPath));
-					const rel = path.relative(path.resolve(ctx.cwd), checkpointPath);
-					if (rel.startsWith("..") || path.isAbsolute(rel)) {
+					checkpointPath = resolveRepoPath(params.checkpointPath, "checkpointPath") || undefined;
+					if (!checkpointPath) {
 						return {
 							content: [{ type: "text", text: `REFUSED: checkpointPath must stay under worker cwd ${path.resolve(ctx.cwd)}` }],
 							details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
 						};
 					}
+				}
+				const producerPid = Number(params.producerPid);
+				const producerMarkerPath = resolveRepoPath(params.producerMarkerPath, "producerMarkerPath");
+				if (!Number.isInteger(producerPid) || producerPid < 2 || !producerMarkerPath || !fs.existsSync(producerMarkerPath)) {
+					return {
+						content: [{ type: "text", text: "REFUSED: wait lease requires a live detached watcher PID and an existing repository launch marker" }],
+						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath },
+					};
+				}
+				let producerMarker: any;
+				try { producerMarker = JSON.parse(fs.readFileSync(producerMarkerPath, "utf-8")); }
+				catch {
+					return {
+						content: [{ type: "text", text: "REFUSED: producer launch marker is not valid JSON" }],
+						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath },
+					};
+				}
+				const markerItem = String(producerMarker?.itemId ?? producerMarker?.item ?? "");
+				const markerTarget = String(producerMarker?.notifyTo ?? producerMarker?.to ?? "");
+				if (Number(producerMarker?.pid) !== producerPid || markerItem !== itemId || markerTarget !== SUBAGENT_TASK_ID) {
+					return {
+						content: [{ type: "text", text: "REFUSED: producer launch marker PID/item/notifyTo does not match this worker lease" }],
+						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath, producerMarker },
+					};
+				}
+				try { process.kill(producerPid, 0); }
+				catch {
+					return {
+						content: [{ type: "text", text: `REFUSED: watcher PID ${producerPid} is not alive` }],
+						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath },
+					};
 				}
 				const now = Date.now();
 				const lease: WaitLease = {
@@ -259,6 +328,8 @@ export default function (pi: ExtensionAPI) {
 					reason: String(params.reason),
 					wakeCondition: String(params.wakeCondition),
 					checkpointPath,
+					producerPid,
+					producerMarkerPath,
 					cwd: path.resolve(ctx.cwd),
 					pid: process.pid,
 					armedAt: now,
@@ -373,7 +444,7 @@ export default function (pi: ExtensionAPI) {
 	// after agent_settled. Hold agent_end (before settled is emitted) only when
 	// this worker explicitly armed a bounded lease. A directed event is queued
 	// as a follow-up, then releases this handler so the same session continues.
-	pi.on("agent_end", async () => {
+	pi.on("agent_end", async (_event, ctx) => {
 		if (!SUBAGENT_TASK_ID) return;
 		try {
 			await collectFiles();
@@ -387,8 +458,21 @@ export default function (pi: ExtensionAPI) {
 		} catch (e) {
 			piLog(`agent_end preflush err ${e}`);
 		}
-		const lease = activeWaitLease || readWaitLease();
-		if (!lease || followUpOutstanding) return;
+		const lease = readWaitLease();
+		activeWaitLease = lease;
+		if (!lease) return;
+		if (followUpOutstanding) {
+			// A follow-up can be queued while this run is busy. The first agent_end
+			// should yield to a genuinely pending message, but after that message is
+			// consumed some hosts do not emit another observable agent_start before
+			// the next agent_end. Never let the stale flag bypass an armed lease.
+			if (ctx.hasPendingMessages()) {
+				piLog(`wait lease deferred for pending followUp task=${SUBAGENT_TASK_ID} item=${lease.itemId}`);
+				return;
+			}
+			followUpOutstanding = false;
+			piLog(`cleared stale followUpOutstanding before wait hold task=${SUBAGENT_TASK_ID}`);
+		}
 		activeWaitLease = lease;
 		const remaining = lease.expiresAt - Date.now();
 		if (remaining <= 0) {
