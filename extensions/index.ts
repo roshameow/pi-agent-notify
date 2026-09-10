@@ -89,6 +89,13 @@ let dedupCache = new Map<string, number>(); // key -> 上次注入时间戳
 let followUpOutstanding = false; // 全局最多一条已排队 followUp；后续事件留在内存继续合并
 let activeWaitLease: WaitLease | null = null;
 let waitLeaseResolve: (() => void) | null = null;
+// A directed event releases the lease so the resumed turn can run. If that turn ends without
+// re-arming but the watcher it was waiting on is still alive, exiting here orphans the watcher and
+// silently loses its wakeup (observed repeatedly 2026-09-11 across several items). Remember the
+// lease that was released by event injection so agent_end can re-arm it exactly once.
+let lastEventReleasedLease: WaitLease | null = null;
+let lastEventReleasedAutoRearmed = false;
+let lastReleasedReason = "";
 let waitLeaseTimer: ReturnType<typeof setTimeout> | null = null;
 
 function waitLeasePath(): string {
@@ -143,10 +150,49 @@ function readWaitLease(): WaitLease | null {
 	}
 }
 
+// Re-arm the lease that a directed event released, but only when its watcher is still alive and
+// the lease has not expired. Bounded: at most once per released lease, and never beyond the
+// original expiry, so a long-lived watcher cannot hold the process forever.
+function rearmReleasedLeaseIfProducerAlive(): WaitLease | null {
+	const previous = lastEventReleasedLease;
+	if (!previous) return null;
+	if (lastReleasedReason !== "directed_event_injected") return null;
+	if (lastEventReleasedAutoRearmed) return null;
+	if (!(previous.expiresAt > Date.now())) return null;
+	try {
+		if (!previous.producerMarkerPath || !fs.existsSync(previous.producerMarkerPath)) return null;
+		const marker = JSON.parse(fs.readFileSync(previous.producerMarkerPath, "utf-8"));
+		if (Number(marker?.pid) !== Number(previous.producerPid)) return null;
+		if (String(marker?.itemId ?? marker?.item ?? "") !== String(previous.itemId)) return null;
+		if (String(marker?.notifyTo ?? marker?.to ?? "") !== String(previous.taskId)) return null;
+		process.kill(previous.producerPid, 0);
+	} catch (_) {
+		return null;
+	}
+	const tmp = `${waitLeasePath()}.${process.pid}.rearm.tmp`;
+	try {
+		fs.writeFileSync(tmp, JSON.stringify(previous), { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(tmp, waitLeasePath());
+	} catch (_) {
+		try { fs.rmSync(tmp, { force: true }); } catch (_) { /* ignore */ }
+		return null;
+	}
+	lastEventReleasedAutoRearmed = true;
+	try {
+		fs.appendFileSync("/tmp/agent-notify.log", `[${new Date().toISOString()}] auto re-armed released wait lease task=${SUBAGENT_TASK_ID} item=${previous.itemId} producer=${previous.producerPid} (worker ended turn without re-arming)\n`);
+	} catch (_) { /* ignore */ }
+	return readWaitLease();
+}
+
 function clearWaitLease(reason: string): void {
 	if (waitLeaseTimer) {
 		clearTimeout(waitLeaseTimer);
 		waitLeaseTimer = null;
+	}
+	lastReleasedReason = reason;
+	if (activeWaitLease) {
+		lastEventReleasedLease = activeWaitLease;
+		lastEventReleasedAutoRearmed = false;
 	}
 	removeWaitLeaseFile();
 	activeWaitLease = null;
@@ -458,7 +504,8 @@ export default function (pi: ExtensionAPI) {
 		} catch (e) {
 			piLog(`agent_end preflush err ${e}`);
 		}
-		const lease = readWaitLease();
+		let lease = readWaitLease();
+		if (!lease) lease = rearmReleasedLeaseIfProducerAlive();
 		activeWaitLease = lease;
 		if (!lease) return;
 		if (followUpOutstanding) {

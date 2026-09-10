@@ -133,6 +133,37 @@ try {
   assert.match(sent[2].text, /wake-after-stale/);
   await emit("agent_start");
 
+  // Regression 2026-09-11 (multiple items): an orchestrator notification wakes a worker out of its
+  // armed wait (consuming the lease). If that resumed turn ends WITHOUT re-arming, the extension
+  // used to exit, orphaning the still-running watcher and silently losing its later wakeup. It must
+  // instead auto re-arm the released lease once while the producer is still alive.
+  await emit("agent_start");
+  const rearmArm = await registeredTool.execute("call-rearm", {
+    itemId, reason: "auto rearm regression", wakeCondition: "auto-rearm-wake", leaseSeconds: 60, ...producer,
+  }, undefined, undefined, ctx);
+  assert.equal(rearmArm.details.armed, true);
+  let rearmEndResolved = false;
+  const rearmEnd = emit("agent_end").then(() => { rearmEndResolved = true; });
+  fs.writeFileSync(path.join(root, taskId, "evt-rearm-wake.json"), JSON.stringify({
+    level: "yellow", source: "unit", message: "wake-rearm", itemId, ts: Date.now(),
+  }));
+  await waitUntil(() => rearmEndResolved);
+  await rearmEnd;
+  assert.equal(fs.existsSync(leasePath), false, "injection must consume the lease");
+  await emit("agent_start");
+  // This turn ends without re-arming: the watcher is still alive, so hold instead of exiting.
+  let resolvedAfterConsume = false;
+  const heldPromise = emit("agent_end").then(() => { resolvedAfterConsume = true; });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(resolvedAfterConsume, false, "released lease with a live producer must be auto re-armed");
+  assert.equal(fs.existsSync(leasePath), true, "auto re-arm must restore the lease file");
+  fs.writeFileSync(path.join(root, taskId, "evt-rearm-release.json"), JSON.stringify({
+    level: "yellow", source: "unit", message: "wake-release", itemId, ts: Date.now(),
+  }));
+  await waitUntil(() => resolvedAfterConsume);
+  await heldPromise;
+  await emit("agent_start");
+
   const mismatch = await registeredTool.execute("call-2", {
     itemId: "999999", reason: "bad", wakeCondition: "bad", leaseSeconds: 60, ...producer,
   }, undefined, undefined, ctx);
