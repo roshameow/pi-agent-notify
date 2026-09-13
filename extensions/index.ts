@@ -1,76 +1,66 @@
-/**
- * agent-notify.ts — 脚本 → 主 agent 直连通知通道（v3：按项目/item 路由 + 合并缓冲 + 去重）
- *
- * 背景：TalentsAI 出题流程里大量 watcher 脚本（keepalive/reviewwatch/评测轮询等）
- * 发现问题后只能语音叫你或写 status.log，你需要再手动告诉 agent 处理。
- * 本扩展让外部脚本能把事件**直接注入主 agent 会话**：
- *   - 外部脚本往触发目录写一个 JSON 文件
- *   - 扩展监听目录，合并缓冲后作为"用户消息"注入
- *   - agent 收到后会自动处理（如评测完成→自动去质检/提交/返修）
- *
- * v3 关键改动（修复串会话与刷屏）：
- *   1. 合并缓冲：发现事件后攒 15s，同一批合成一条消息注入（不逐条发）
- *   2. 去重缓存：同 key（source+itemId+消息前缀）30 分钟内只注入一次，
- *      避免 keepalive 每 60s 反复报同一事件刷屏
- *   3. busy 时只排一条 followUp（合并后的），不逐条排队
- *
- * 用法（外部脚本）：
- *   python3 scripts/notify_agent.py "消息文本" --level yellow --source reviewwatch
- *
- * 触发目录：/tmp/pi-agent-notify/；主 session 使用 main/{sessionId} 专属收件箱，worker 使用 task-{id} 收件箱。
- *
- * level 语义：
- *   green  = 正常推进，注入 agent 备忘（不打扰）
- *   yellow = agent 可处理的事件，注入并触发一轮 agent 处理（默认）
- *   red    = 需用户拍板/卡死，注入 agent 并额外 ctx.ui.notify 高亮
- */
-
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const TRIGGER_DIR_BASE = process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify";
-// 身份感知：subagent 用独立的通知子目录（防多会话抢文件）。
-// 主 session 不能共用基础目录：多个项目/会话会竞争同一个 evt 文件，导致通知串到别的对话。
-// 主 session 的收件箱在 main/{sessionId}，由 notify_agent.py 按 itemId + cwd 路由。
-const SUBAGENT_TASK_ID = process.env.PI_SUBAGENT_TASK_ID || "";
-let TRIGGER_DIR = SUBAGENT_TASK_ID ? `${TRIGGER_DIR_BASE}/${SUBAGENT_TASK_ID}` : "";
-let PENDING_SCOPE_DIR = "";
-const MAIN_REGISTRY_DIR = `${TRIGGER_DIR_BASE}/.main-sessions`;
-const MAIN_PENDING_DIR = `${TRIGGER_DIR_BASE}/main-pending`;
-const MAIN_HEARTBEAT_MS = 30_000;
-let sessionRegistryFile = "";
-let sessionHeartbeat: ReturnType<typeof setInterval> | null = null;
-let sessionScope = "";
-let sessionId = "";
-
-function safeSessionKey(value: string): string {
-	return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
-}
-function scopeKey(value: string): string {
-	return createHash("sha256").update(value).digest("hex").slice(0, 16);
-}
-const SCAN_INTERVAL_MS = Math.max(50, Number(process.env.PI_AGENT_NOTIFY_SCAN_MS || 2000));
-const BATCH_WINDOW_MS = Math.max(0, Number(process.env.PI_AGENT_NOTIFY_BATCH_MS || 15000)); // 合并缓冲窗口：默认攒 15s
-const DEDUP_COOLDOWN_MS = 30 * 60 * 1000; // 去重冷却 30 分钟
+const INBOX_ROOT = path.resolve(process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify");
+const STATE_ROOT = path.resolve(process.env.PI_AGENT_NOTIFY_STATE_DIR || path.join(os.homedir(), ".pi", "agent", "agent-notify"));
+const OUTBOX_DIR = path.join(STATE_ROOT, "outbox");
+const QUARANTINE_DIR = path.join(STATE_ROOT, "quarantine");
+const EVENT_LOG = process.env.PI_AGENT_NOTIFY_LOG || path.join(STATE_ROOT, "events.log");
+const MAIN_REGISTRY_DIR = path.join(INBOX_ROOT, ".main-sessions");
+const MAIN_PENDING_DIR = path.join(INBOX_ROOT, "main-pending");
+const WORKER_REGISTRY = path.join(INBOX_ROOT, ".active-workers.json");
 const WAIT_LEASE_FILE = ".notification-wait-lease";
+const RECEIVER_IDENTITY_FILE = ".receiver-identity.json";
+const SUBAGENT_TASK_ID = process.env.PI_SUBAGENT_TASK_ID || "";
+const SCAN_INTERVAL_MS = Math.max(50, Number(process.env.PI_AGENT_NOTIFY_SCAN_MS || 2000));
+const BATCH_WINDOW_MS = Math.max(0, Number(process.env.PI_AGENT_NOTIFY_BATCH_MS || 15000));
+const DEDUP_COOLDOWN_MS = Math.max(1000, Number(process.env.PI_AGENT_NOTIFY_DEDUP_MS || 30 * 60 * 1000));
+const MAIN_HEARTBEAT_MS = 15000;
+const LIVE_HEARTBEAT_MS = 90000;
 const MIN_WAIT_LEASE_SECONDS = 30;
 const MAX_WAIT_LEASE_SECONDS = 24 * 60 * 60;
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+const MAX_AGE_BY_LEVEL: Record<string, number> = {
+	green: 6 * 60 * 60 * 1000,
+	yellow: 48 * 60 * 60 * 1000,
+	red: 7 * 24 * 60 * 60 * 1000,
+};
+const SAFE_ITEM_KEY = /^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,199}$/;
+const SAFE_TARGET_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
 interface NotifyEvent {
-	level: string;
+	version: 2;
+	eventId: string;
+	runId: string;
+	itemKey: string;
+	targetKind: "main" | "worker";
+	targetId: string;
+	state: string;
+	sequence: number;
+	checkpointPath?: string;
+	occurredAt: string;
+	nonce: string;
+	level: "green" | "yellow" | "red";
 	source: string;
 	message: string;
-	itemId?: string;
-	ts?: number;
+	actionable?: boolean;
+	terminal?: boolean;
+	expiresAt?: string;
+	legacyItemId?: string;
+	_outboxPath?: string;
 }
 
 interface WaitLease {
-	version: 1;
+	version: 2;
 	leaseId: string;
 	taskId: string;
-	itemId: string;
+	itemKey: string;
+	itemId?: string;
+	runId: string;
+	nonce: string;
 	reason: string;
 	wakeCondition: string;
 	checkpointPath?: string;
@@ -82,615 +72,760 @@ interface WaitLease {
 	expiresAt: number;
 }
 
-let currentCtx: any = null; // 最近一次 session_start 的 ctx
-let pendingEvents: NotifyEvent[] = []; // 合并缓冲
-let batchTimer: ReturnType<typeof setTimeout> | null = null;
-let dedupCache = new Map<string, number>(); // key -> 上次注入时间戳
-let followUpOutstanding = false; // 全局最多一条已排队 followUp；后续事件留在内存继续合并
+interface DedupState {
+	version: 1;
+	seen: Record<string, number>;
+	semantic: Record<string, number>;
+	streams: Record<string, { sequence: number; occurredAt: number }>;
+}
+
+let currentCtx: any = null;
+let currentSessionId = "";
+let currentRunId = "";
+let currentNonce = "";
+let inboxDir = SUBAGENT_TASK_ID ? path.join(INBOX_ROOT, SUBAGENT_TASK_ID) : "";
+let sessionRegistryFile = "";
+let pendingScopeDir = "";
+let pendingEvents: NotifyEvent[] = [];
+let pendingEventIds = new Set<string>();
+let followUpOutstanding = false;
 let activeWaitLease: WaitLease | null = null;
-let waitLeaseResolve: (() => void) | null = null;
-// A directed event releases the lease so the resumed turn can run. If that turn ends without
-// re-arming but the watcher it was waiting on is still alive, exiting here orphans the watcher and
-// silently loses its wakeup (observed repeatedly 2026-09-11 across several items). Remember the
-// lease that was released by event injection so agent_end can re-arm it exactly once.
 let lastEventReleasedLease: WaitLease | null = null;
 let lastEventReleasedAutoRearmed = false;
 let lastReleasedReason = "";
+let waitLeaseResolve: (() => void) | null = null;
 let waitLeaseTimer: ReturnType<typeof setTimeout> | null = null;
+let scanTimer: ReturnType<typeof setInterval> | null = null;
+let batchTimer: ReturnType<typeof setTimeout> | null = null;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let watchers: fs.FSWatcher[] = [];
+let dedupState: DedupState = { version: 1, seen: {}, semantic: {}, streams: {} };
+
+function isSafeItemKey(value: unknown): value is string {
+	return typeof value === "string" && SAFE_ITEM_KEY.test(value) && value !== "." && value !== ".." && !value.includes("//");
+}
+
+function isSafeTargetId(value: unknown): value is string {
+	return typeof value === "string" && SAFE_TARGET_ID.test(value);
+}
+
+function ensurePrivateDir(dir: string): void {
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	try { fs.chmodSync(dir, 0o700); } catch {}
+}
+
+function fsyncDir(dir: string): void {
+	try {
+		const fd = fs.openSync(dir, "r");
+		try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+	} catch {}
+}
+
+function atomicWrite(file: string, content: string): void {
+	ensurePrivateDir(path.dirname(file));
+	const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(tmp, "wx", 0o600);
+		fs.writeFileSync(fd, content, "utf8");
+		fs.fsyncSync(fd);
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+	fs.renameSync(tmp, file);
+	try { fs.chmodSync(file, 0o600); } catch {}
+	fsyncDir(path.dirname(file));
+}
+
+function atomicWriteJson(file: string, value: unknown): void {
+	atomicWrite(file, JSON.stringify(value));
+}
+
+function log(message: string, event?: NotifyEvent): void {
+	try {
+		ensurePrivateDir(path.dirname(EVENT_LOG));
+		fs.appendFileSync(EVENT_LOG, JSON.stringify({ at: new Date().toISOString(), message, eventId: event?.eventId,
+			targetKind: event?.targetKind, targetId: event?.targetId, itemKey: event?.itemKey }) + "\n", { encoding: "utf8", mode: 0o600 });
+	} catch {}
+}
+
+function pidAlive(pid: unknown): boolean {
+	const value = Number(pid);
+	if (!Number.isInteger(value) || value < 2) return false;
+	try { process.kill(value, 0); return true; } catch { return false; }
+}
+
+function parseTime(value: unknown): number {
+	if (typeof value === "number") return value < 10_000_000_000 ? value * 1000 : value;
+	const parsed = Date.parse(String(value || ""));
+	return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function hash(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function scopeKey(value: string): string {
+	return hash(path.resolve(value)).slice(0, 16);
+}
 
 function waitLeasePath(): string {
-	return path.join(TRIGGER_DIR, WAIT_LEASE_FILE);
+	return path.join(inboxDir, WAIT_LEASE_FILE);
+}
+
+function receiverIdentityPath(): string {
+	return path.join(inboxDir, RECEIVER_IDENTITY_FILE);
 }
 
 function readWorkerRegistration(taskId: string): any | null {
 	try {
-		const registry = JSON.parse(fs.readFileSync(path.join(TRIGGER_DIR_BASE, ".active-workers.json"), "utf-8"));
-		return registry?.workers?.[taskId] || null;
-	} catch (_) {
-		return null;
-	}
+		const registry = JSON.parse(fs.readFileSync(WORKER_REGISTRY, "utf8"));
+		const record = registry?.workers?.[taskId];
+		if (!record || !pidAlive(record.ownerPid ?? record.pid)) return null;
+		const heartbeat = parseTime(record.heartbeatAt || record.startedAt);
+		if (Number.isFinite(heartbeat) && Date.now() - heartbeat > 120000) return null;
+		return record;
+	} catch { return null; }
+}
+
+function registrationKeys(record: any): string[] {
+	return [...new Set([
+		...(Array.isArray(record?.itemKeys) ? record.itemKeys : []),
+		...(Array.isArray(record?.itemIds) ? record.itemIds : []),
+	].map(String))];
+}
+
+function markerMatchesLease(value: any): boolean {
+	try {
+		const marker = JSON.parse(fs.readFileSync(value.producerMarkerPath, "utf8"));
+		const markerItem = String(marker?.itemKey ?? marker?.itemId ?? marker?.item ?? "");
+		const markerTarget = String(marker?.notifyTo ?? marker?.to ?? "");
+		return Number(marker?.pid) === Number(value.producerPid)
+			&& markerItem === String(value.itemKey)
+			&& markerTarget === String(value.taskId);
+	} catch { return false; }
 }
 
 function removeWaitLeaseFile(): void {
-	try { fs.rmSync(waitLeasePath(), { force: true }); } catch (_) { /* ignore */ }
+	try { fs.rmSync(waitLeasePath(), { force: true }); } catch {}
 }
 
-function readWaitLease(): WaitLease | null {
+function readWaitLease(requireLiveProducer = false): WaitLease | null {
 	if (!SUBAGENT_TASK_ID) return null;
 	try {
-		const value = JSON.parse(fs.readFileSync(waitLeasePath(), "utf-8"));
-		let producerAlive = false;
-		try {
-			producerAlive = Number.isInteger(value?.producerPid)
-				&& value.producerPid >= 2
-				&& typeof value?.producerMarkerPath === "string"
-				&& fs.existsSync(value.producerMarkerPath);
-			if (producerAlive) {
-				const marker = JSON.parse(fs.readFileSync(value.producerMarkerPath, "utf-8"));
-				producerAlive = Number(marker?.pid) === Number(value.producerPid)
-					&& String(marker?.itemId ?? marker?.item ?? "") === String(value.itemId)
-					&& String(marker?.notifyTo ?? marker?.to ?? "") === String(value.taskId);
-			}
-			if (producerAlive) process.kill(value.producerPid, 0);
-		} catch { producerAlive = false; }
-		const valid = value?.version === 1
+		const value = JSON.parse(fs.readFileSync(waitLeasePath(), "utf8"));
+		const valid = value?.version === 2
 			&& value?.taskId === SUBAGENT_TASK_ID
-			&& /^\d{6}$/.test(String(value?.itemId || ""))
-			&& Number.isFinite(value?.expiresAt)
-			&& value.expiresAt > Date.now()
-			&& producerAlive;
-		if (!valid) {
+			&& isSafeItemKey(value?.itemKey)
+			&& isSafeTargetId(value?.runId)
+			&& typeof value?.nonce === "string" && value.nonce.length >= 16
+			&& Number.isFinite(value?.expiresAt) && value.expiresAt > Date.now()
+			&& path.resolve(value?.cwd || "") === path.resolve(currentCtx?.cwd || value?.cwd || "");
+		const producerValid = markerMatchesLease(value) && (!requireLiveProducer || pidAlive(value.producerPid));
+		if (!valid || !producerValid) {
 			removeWaitLeaseFile();
 			return null;
 		}
 		return value as WaitLease;
-	} catch (e: any) {
-		if (e?.code !== "ENOENT") removeWaitLeaseFile();
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") removeWaitLeaseFile();
 		return null;
 	}
 }
 
-// Re-arm the lease that a directed event released, but only when its watcher is still alive and
-// the lease has not expired. Bounded: at most once per released lease, and never beyond the
-// original expiry, so a long-lived watcher cannot hold the process forever.
 function rearmReleasedLeaseIfProducerAlive(): WaitLease | null {
 	const previous = lastEventReleasedLease;
-	if (!previous) return null;
-	if (lastReleasedReason !== "directed_event_injected") return null;
-	if (lastEventReleasedAutoRearmed) return null;
-	if (!(previous.expiresAt > Date.now())) return null;
+	if (!previous || lastReleasedReason !== "matching_directed_event_delivered"
+		|| lastEventReleasedAutoRearmed || previous.expiresAt <= Date.now()) return null;
+	if (!markerMatchesLease(previous) || !pidAlive(previous.producerPid)) return null;
 	try {
-		if (!previous.producerMarkerPath || !fs.existsSync(previous.producerMarkerPath)) return null;
-		const marker = JSON.parse(fs.readFileSync(previous.producerMarkerPath, "utf-8"));
-		if (Number(marker?.pid) !== Number(previous.producerPid)) return null;
-		if (String(marker?.itemId ?? marker?.item ?? "") !== String(previous.itemId)) return null;
-		if (String(marker?.notifyTo ?? marker?.to ?? "") !== String(previous.taskId)) return null;
-		process.kill(previous.producerPid, 0);
-	} catch (_) {
-		return null;
-	}
-	const tmp = `${waitLeasePath()}.${process.pid}.rearm.tmp`;
-	try {
-		fs.writeFileSync(tmp, JSON.stringify(previous), { encoding: "utf-8", mode: 0o600 });
-		fs.renameSync(tmp, waitLeasePath());
-	} catch (_) {
-		try { fs.rmSync(tmp, { force: true }); } catch (_) { /* ignore */ }
-		return null;
-	}
-	lastEventReleasedAutoRearmed = true;
-	try {
-		fs.appendFileSync("/tmp/agent-notify.log", `[${new Date().toISOString()}] auto re-armed released wait lease task=${SUBAGENT_TASK_ID} item=${previous.itemId} producer=${previous.producerPid} (worker ended turn without re-arming)\n`);
-	} catch (_) { /* ignore */ }
-	return readWaitLease();
+		atomicWriteJson(waitLeasePath(), previous);
+		lastEventReleasedAutoRearmed = true;
+		log(`auto re-armed released wait lease task=${SUBAGENT_TASK_ID} itemKey=${previous.itemKey} producer=${previous.producerPid}`);
+		return readWaitLease(true);
+	} catch { return null; }
 }
 
 function clearWaitLease(reason: string): void {
-	if (waitLeaseTimer) {
-		clearTimeout(waitLeaseTimer);
-		waitLeaseTimer = null;
-	}
+	if (waitLeaseTimer) clearTimeout(waitLeaseTimer);
+	waitLeaseTimer = null;
 	lastReleasedReason = reason;
-	if (activeWaitLease) {
+	if (reason === "matching_directed_event_delivered" && activeWaitLease) {
+		const sameAutoRearmedLease = lastEventReleasedAutoRearmed
+			&& lastEventReleasedLease?.leaseId === activeWaitLease.leaseId;
 		lastEventReleasedLease = activeWaitLease;
-		lastEventReleasedAutoRearmed = false;
+		if (!sameAutoRearmedLease) lastEventReleasedAutoRearmed = false;
 	}
 	removeWaitLeaseFile();
 	activeWaitLease = null;
 	const resolve = waitLeaseResolve;
 	waitLeaseResolve = null;
 	if (resolve) resolve();
-	try {
-		fs.appendFileSync("/tmp/agent-notify.log", `[${new Date().toISOString()}] wait lease released task=${SUBAGENT_TASK_ID || "main"} reason=${reason}\n`);
-	} catch (_) { /* ignore */ }
+	log(`wait lease released task=${SUBAGENT_TASK_ID || "main"} reason=${reason}`);
 }
 
-function discoverSessionItems(ctx: any): string[] {
-	// 只登记当前项目台账中的 item，避免把普通数字（日期、端口、金额）误当题目。
-	try {
-		const ledgerPath = path.join(ctx.cwd, "docs", "current_tasks.json");
-		const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf-8"));
-		const known = new Set(Object.keys(ledger.items || {}).filter((x) => /^\d+$/.test(x)));
-		const entries = ctx.sessionManager?.getEntries?.() || [];
-		const text = JSON.stringify(entries);
-		return [...known].filter((id) => new RegExp(`(?:^|\\D)${id}(?:$|\\D)`).test(text));
-	} catch (_) {
-		return [];
+function mainIdentity(sessionId: string): { runId: string; nonce: string } {
+	const globalKey = "__pi_agent_notify_main_identities__";
+	const globalState = globalThis as any;
+	if (!globalState[globalKey]) globalState[globalKey] = new Map<string, { runId: string; nonce: string }>();
+	const identities = globalState[globalKey] as Map<string, { runId: string; nonce: string }>;
+	let identity = identities.get(sessionId);
+	if (!identity) {
+		identity = { runId: `run-${randomUUID()}`, nonce: randomUUID().replaceAll("-", "") };
+		identities.set(sessionId, identity);
+	}
+	return identity;
+}
+
+function cleanupMainRegistrations(): void {
+	let names: string[] = [];
+	try { names = fs.readdirSync(MAIN_REGISTRY_DIR); } catch { return; }
+	for (const name of names) {
+		if (!name.endsWith(".json")) continue;
+		const file = path.join(MAIN_REGISTRY_DIR, name);
+		try {
+			const record = JSON.parse(fs.readFileSync(file, "utf8"));
+			const heartbeat = parseTime(record?.heartbeatAt ?? record?.heartbeat);
+			if (!pidAlive(record?.pid) || !Number.isFinite(heartbeat) || Date.now() - heartbeat > LIVE_HEARTBEAT_MS) fs.rmSync(file, { force: true });
+		} catch { fs.rmSync(file, { force: true }); }
 	}
 }
 
 function writeSessionRegistration(ctx: any): void {
 	if (SUBAGENT_TASK_ID || !sessionRegistryFile) return;
 	try {
-		const record = {
-			sessionId,
+		cleanupMainRegistrations();
+		atomicWriteJson(sessionRegistryFile, {
+			version: 2,
+			targetKind: "main",
+			targetId: currentSessionId,
+			sessionId: currentSessionId,
+			runId: currentRunId,
+			nonce: currentNonce,
 			pid: process.pid,
-			cwd: sessionScope,
+			cwd: path.resolve(ctx.cwd),
 			sessionFile: ctx.sessionManager?.getSessionFile?.() || null,
-			inbox: TRIGGER_DIR,
-			items: discoverSessionItems(ctx),
-			heartbeat: Date.now(),
-		};
-		const tmp = `${sessionRegistryFile}.${process.pid}.tmp`;
-		fs.mkdirSync(MAIN_REGISTRY_DIR, { recursive: true });
-		fs.writeFileSync(tmp, JSON.stringify(record), "utf-8");
-		fs.renameSync(tmp, sessionRegistryFile);
-	} catch (e) {
-		try {
-			fs.appendFileSync("/tmp/agent-notify.log", `[${new Date().toISOString()}] session registration err ${e}\n`);
-		} catch (_) { /* ignore */ }
-	}
+			inbox: inboxDir,
+			heartbeatAt: new Date().toISOString(),
+			heartbeat: Date.now(), // protocol-v1 sender compatibility
+			items: [],
+		});
+	} catch (error) { log(`session registration failed: ${error}`); }
+}
+
+function writeWorkerReceiverIdentity(ctx: any): void {
+	if (!SUBAGENT_TASK_ID) return;
+	const registration = readWorkerRegistration(SUBAGENT_TASK_ID);
+	atomicWriteJson(receiverIdentityPath(), {
+		version: 2, targetKind: "worker", targetId: SUBAGENT_TASK_ID,
+		taskId: SUBAGENT_TASK_ID, runId: currentRunId, nonce: currentNonce,
+		pid: process.pid, cwd: path.resolve(ctx.cwd),
+		itemKeys: registrationKeys(registration), heartbeatAt: new Date().toISOString(),
+	});
+}
+
+function removeWorkerReceiverIdentity(): void {
+	if (!SUBAGENT_TASK_ID) return;
+	try {
+		const value = JSON.parse(fs.readFileSync(receiverIdentityPath(), "utf8"));
+		if (Number(value?.pid) === process.pid && value?.runId === currentRunId) fs.rmSync(receiverIdentityPath(), { force: true });
+	} catch {}
 }
 
 function removeSessionRegistration(): void {
-	if (sessionHeartbeat) {
-		clearInterval(sessionHeartbeat);
-		sessionHeartbeat = null;
-	}
-	if (sessionRegistryFile) {
-		try { fs.rmSync(sessionRegistryFile, { force: true }); } catch (_) { /* ignore */ }
-	}
+	if (!sessionRegistryFile) return;
+	try {
+		const current = JSON.parse(fs.readFileSync(sessionRegistryFile, "utf8"));
+		if (Number(current?.pid) === process.pid && current?.runId === currentRunId) fs.rmSync(sessionRegistryFile, { force: true });
+	} catch {}
 	sessionRegistryFile = "";
 }
 
-export default function (pi: ExtensionAPI) {
-	let scanTimer: ReturnType<typeof setInterval> | null = null;
+function dedupPath(): string {
+	const target = SUBAGENT_TASK_ID || currentSessionId || "unbound";
+	return path.join(STATE_ROOT, "dedup", `${hash(`${SUBAGENT_TASK_ID ? "worker" : "main"}:${target}`).slice(0, 24)}.json`);
+}
 
+function loadDedup(): void {
+	try {
+		const value = JSON.parse(fs.readFileSync(dedupPath(), "utf8"));
+		if (value?.version === 1) dedupState = { version: 1, seen: value.seen || {}, semantic: value.semantic || {}, streams: value.streams || {} };
+	} catch { dedupState = { version: 1, seen: {}, semantic: {}, streams: {} }; }
+	pruneDedup();
+}
+
+function pruneDedup(): void {
+	const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+	for (const map of [dedupState.seen, dedupState.semantic]) {
+		for (const [key, timestamp] of Object.entries(map)) if (timestamp < cutoff) delete map[key];
+	}
+}
+
+function saveDedup(): void {
+	pruneDedup();
+	try { atomicWriteJson(dedupPath(), dedupState); } catch (error) { log(`dedup save failed: ${error}`); }
+}
+
+function semanticKey(event: NotifyEvent): string {
+	const source = event.level === "red" ? "*" : event.source;
+	return hash(`${source}|${event.itemKey}|${event.state}|${event.message.slice(0, 120)}`);
+}
+
+function streamKey(event: NotifyEvent): string {
+	return hash(`${event.targetKind}|${event.targetId}|${event.itemKey}|${event.runId}|${event.source}`);
+}
+
+function staleReason(event: NotifyEvent, now = Date.now()): string | null {
+	const occurred = parseTime(event.occurredAt);
+	if (!Number.isFinite(occurred)) return "invalid occurredAt";
+	if (occurred > now + FUTURE_SKEW_MS) return "occurredAt too far in future";
+	const expiry = event.expiresAt ? parseTime(event.expiresAt) : occurred + MAX_AGE_BY_LEVEL[event.level];
+	if (!Number.isFinite(expiry) || expiry <= now) return "expired";
+	if (dedupState.seen[event.eventId]) return "duplicate eventId";
+	const semantic = dedupState.semantic[semanticKey(event)] || 0;
+	if (now - semantic < DEDUP_COOLDOWN_MS) return "semantic duplicate";
+	const latest = dedupState.streams[streamKey(event)];
+	if (latest && (event.sequence < latest.sequence || (event.sequence === latest.sequence && occurred <= latest.occurredAt))) return "stale sequence";
+	if (latest && occurred < latest.occurredAt) return "stale occurredAt";
+	return null;
+}
+
+function markDelivered(event: NotifyEvent): void {
+	const now = Date.now();
+	dedupState.seen[event.eventId] = now;
+	dedupState.semantic[semanticKey(event)] = now;
+	dedupState.streams[streamKey(event)] = { sequence: event.sequence, occurredAt: parseTime(event.occurredAt) };
+	saveDedup();
+	if (event._outboxPath) {
+		try { fs.rmSync(event._outboxPath, { force: true }); } catch {}
+	}
+	log("delivered", event);
+}
+
+function discardEvent(event: NotifyEvent, reason: string): void {
+	if (event._outboxPath) {
+		try { fs.rmSync(event._outboxPath, { force: true }); } catch {}
+	}
+	log(`discarded: ${reason}`, event);
+}
+
+function quarantine(file: string, reason: string): void {
+	try {
+		ensurePrivateDir(QUARANTINE_DIR);
+		const target = path.join(QUARANTINE_DIR, `${Date.now()}-${path.basename(file).replace(/[^A-Za-z0-9._-]/g, "_")}`);
+		fs.copyFileSync(file, target);
+		try { fs.chmodSync(target, 0o600); } catch {}
+		fs.appendFileSync(`${target}.reason`, reason + "\n", { encoding: "utf8", mode: 0o600 });
+	} catch {}
+	try { fs.rmSync(file, { force: true }); } catch {}
+	log(`quarantined ${path.basename(file)}: ${reason}`);
+}
+
+function normalizeEvent(obj: any, raw: string, outboxPath?: string): NotifyEvent | null {
+	if (!obj || typeof obj !== "object") return null;
+	const legacy = obj.version !== 2;
+	const declaredItem = String(obj.itemKey ?? obj.itemId ?? "");
+	// Protocol-v1 allowed unscoped main-session notices. Preserve them under a
+	// synthetic domain-neutral key; worker notices still require explicit ownership.
+	const itemKey = declaredItem || (legacy && !SUBAGENT_TASK_ID ? `legacy:scope:${scopeKey(currentCtx?.cwd || ".")}` : "");
+	const level = String(obj.level || (obj.state === "green" || obj.state === "yellow" || obj.state === "red" ? obj.state : "yellow"));
+	const targetKind = String(obj.targetKind || (SUBAGENT_TASK_ID ? "worker" : "main"));
+	const targetId = String(obj.targetId || (SUBAGENT_TASK_ID || currentSessionId));
+	const occurredMs = parseTime(obj.occurredAt ?? obj.ts ?? Date.now());
+	const eventId = String(obj.eventId || `legacy-${hash(raw)}`);
+	const event: NotifyEvent = {
+		version: 2,
+		eventId,
+		runId: String(obj.runId || (legacy ? currentRunId : "")),
+		itemKey,
+		targetKind: targetKind as any,
+		targetId,
+		state: String(obj.state || (level === "green" ? "progress" : "actionable")),
+		sequence: Number(obj.sequence ?? occurredMs),
+		checkpointPath: obj.checkpointPath ? String(obj.checkpointPath) : undefined,
+		occurredAt: Number.isFinite(occurredMs) ? new Date(occurredMs).toISOString() : String(obj.occurredAt || ""),
+		nonce: String(obj.nonce || (legacy ? currentNonce : "")),
+		level: level as any,
+		source: String(obj.source || "script").slice(0, 120),
+		message: String(obj.message ?? obj.text ?? "").slice(0, 12000),
+		actionable: obj.actionable === true,
+		terminal: obj.terminal === true,
+		expiresAt: obj.expiresAt ? new Date(parseTime(obj.expiresAt)).toISOString() : undefined,
+		legacyItemId: obj.itemId ? String(obj.itemId) : undefined,
+		_outboxPath: outboxPath,
+	};
+	if (!isSafeTargetId(event.eventId) || !isSafeTargetId(event.runId) || !isSafeItemKey(event.itemKey)
+		|| !isSafeTargetId(event.targetId) || !["main", "worker"].includes(event.targetKind)
+		|| !["green", "yellow", "red"].includes(event.level) || !event.message
+		|| !Number.isSafeInteger(event.sequence) || event.sequence < 0 || !event.state || event.state.length > 120
+		|| event.nonce.length < 16 || event.nonce.length > 200) return null;
+	return event;
+}
+
+function eventMatchesReceiver(event: NotifyEvent): string | null {
+	if (SUBAGENT_TASK_ID) {
+		if (event.targetKind !== "worker" || event.targetId !== SUBAGENT_TASK_ID) return "wrong worker target";
+		if (event.runId !== currentRunId || event.nonce !== currentNonce) return "stale worker run identity";
+		const registration = readWorkerRegistration(SUBAGENT_TASK_ID);
+		if (!registration || !registrationKeys(registration).includes(event.itemKey)) return "worker no longer owns itemKey";
+		const lease = readWaitLease(false);
+		if (lease && event.itemKey !== lease.itemKey) return "itemKey does not match active lease";
+		return null;
+	}
+	if (event.targetKind !== "main" || event.targetId !== currentSessionId) return "wrong main target";
+	if (event.runId !== currentRunId || event.nonce !== currentNonce) return "stale main run identity";
+	return null;
+}
+
+function enqueueEvent(event: NotifyEvent): void {
+	if (pendingEventIds.has(event.eventId)) return;
+	pendingEventIds.add(event.eventId);
+	pendingEvents.push(event);
+}
+
+function collectDirectory(dir: string, outbox = false): void {
+	let names: string[] = [];
+	try { names = fs.readdirSync(dir).filter((name) => name.endsWith(".json")).slice(0, 1000); } catch { return; }
+	for (const name of names) {
+		const file = path.join(dir, name);
+		if (outbox) {
+			try {
+				if (!fs.lstatSync(file).isFile()) continue;
+				const raw = fs.readFileSync(file, "utf8");
+				const rawObj = JSON.parse(raw);
+				if (String(rawObj?.targetKind) !== (SUBAGENT_TASK_ID ? "worker" : "main")
+					|| String(rawObj?.targetId) !== (SUBAGENT_TASK_ID || currentSessionId)) continue;
+				const event = normalizeEvent(rawObj, raw, file);
+				if (!event) { quarantine(file, "invalid outbox envelope"); continue; }
+				const mismatch = eventMatchesReceiver(event);
+				if (mismatch) { quarantine(file, mismatch); continue; }
+				enqueueEvent(event);
+			} catch (error) { quarantine(file, `outbox parse failed: ${error}`); }
+			continue;
+		}
+		const processing = `${file}.${process.pid}.processing`;
+		try {
+			if (!fs.lstatSync(file).isFile()) continue;
+			fs.renameSync(file, processing);
+			const raw = fs.readFileSync(processing, "utf8");
+			const event = normalizeEvent(JSON.parse(raw), raw);
+			if (!event) { quarantine(processing, "invalid inbox envelope"); continue; }
+			const mismatch = eventMatchesReceiver(event);
+			if (mismatch) { quarantine(processing, mismatch); continue; }
+			enqueueEvent(event);
+			fs.rmSync(processing, { force: true });
+		} catch (error) { quarantine(processing, `inbox collection failed: ${error}`); }
+	}
+}
+
+function collectFiles(): void {
+	collectDirectory(inboxDir, false);
+	if (!SUBAGENT_TASK_ID && pendingScopeDir) collectDirectory(pendingScopeDir, false);
+	collectDirectory(OUTBOX_DIR, true);
+}
+
+function isImmediate(event: NotifyEvent): boolean {
+	const lease = SUBAGENT_TASK_ID ? readWaitLease(false) : null;
+	const directedWaitWake = !!lease && event.targetKind === "worker"
+		&& event.targetId === SUBAGENT_TASK_ID && event.itemKey === lease.itemKey;
+	return directedWaitWake || event.level === "red"
+		|| (event.level === "yellow" && (event.actionable || event.terminal || ["actionable", "terminal"].includes(event.state.toLowerCase())));
+}
+
+async function scheduleFlush(): Promise<void> {
+	collectFiles();
+	if (pendingEvents.length === 0) return;
+	if (pendingEvents.some(isImmediate)) {
+		if (batchTimer) clearTimeout(batchTimer);
+		batchTimer = null;
+		await flushBatch();
+		return;
+	}
+	if (!batchTimer) {
+		batchTimer = setTimeout(() => {
+			batchTimer = null;
+			flushBatch().catch((error) => log(`batch failed: ${error}`));
+		}, BATCH_WINDOW_MS);
+		batchTimer.unref?.();
+	}
+}
+
+function formatEvent(event: NotifyEvent): string {
+	const icon = event.level === "red" ? "🔴" : event.level === "green" ? "🟢" : "🟡";
+	return `${icon}[${event.source}] [${event.itemKey}] [${event.state}#${event.sequence}] ${event.message}`;
+}
+
+function passiveGreen(event: NotifyEvent): boolean {
+	try {
+		piApi?.appendEntry?.("agent-notify", { ...event, _outboxPath: undefined, receivedAt: new Date().toISOString() });
+		if (currentCtx?.hasUI) currentCtx.ui.setStatus("agent-notify", `🟢 ${event.itemKey}: ${event.state}`);
+		markDelivered(event);
+		return true;
+	} catch (error) {
+		log(`passive green update failed: ${error}`, event);
+		return false;
+	}
+}
+
+let piApi: ExtensionAPI | null = null;
+
+async function flushBatch(): Promise<void> {
+	if (pendingEvents.length === 0 || !piApi) return;
+	const batch = pendingEvents;
+	pendingEvents = [];
+	for (const event of batch) pendingEventIds.delete(event.eventId);
+	const actionable: NotifyEvent[] = [];
+	for (const event of batch) {
+		const stale = staleReason(event);
+		if (stale) { discardEvent(event, stale); continue; }
+		const lease = SUBAGENT_TASK_ID ? readWaitLease(false) : null;
+		const directedWaitWake = !!lease && event.targetKind === "worker"
+			&& event.targetId === SUBAGENT_TASK_ID && event.itemKey === lease.itemKey;
+		// Green remains passive for ordinary progress, but a directed event that
+		// matches an armed wait must wake the worker regardless of display level.
+		if (event.level === "green" && !directedWaitWake) {
+			if (!passiveGreen(event)) enqueueEvent(event);
+		} else actionable.push(event);
+	}
+	if (actionable.length === 0) return;
+
+	if (!(currentCtx?.isIdle?.()) && followUpOutstanding) {
+		for (const event of actionable) enqueueEvent(event);
+		log(`followUp outstanding; retained ${actionable.length} event(s)`);
+		return;
+	}
+	const body = `[agent-notify]\n${actionable.map(formatEvent).join("\n")}\n\nExternal directed events were validated. Re-read the authoritative state/checkpoint before acting; do not assume the notification itself proves completion.`;
+	try {
+		if (currentCtx?.isIdle?.()) piApi.sendUserMessage(body);
+		else {
+			piApi.sendUserMessage(body, { deliverAs: "followUp" });
+			followUpOutstanding = true;
+		}
+		for (const event of actionable) markDelivered(event);
+		if (SUBAGENT_TASK_ID) clearWaitLease("matching_directed_event_delivered");
+		if (actionable.some((event) => event.level === "red") && currentCtx?.hasUI) currentCtx.ui.notify("🔴 External event needs attention", "error");
+	} catch (error) {
+		for (const event of actionable) enqueueEvent(event);
+		log(`injection failed; retained ${actionable.length}: ${error}`);
+	}
+}
+
+function cleanupStaleFiles(): void {
+	const now = Date.now();
+	for (const dir of [inboxDir, OUTBOX_DIR, MAIN_REGISTRY_DIR, ...(!SUBAGENT_TASK_ID && pendingScopeDir ? [pendingScopeDir] : [])]) {
+		let names: string[] = [];
+		try { names = fs.readdirSync(dir); } catch { continue; }
+		for (const name of names) {
+			const file = path.join(dir, name);
+			try {
+				const age = now - fs.statSync(file).mtimeMs;
+				if (name.includes(".tmp") && age > 5 * 60 * 1000) fs.rmSync(file, { force: true });
+				else if (name.endsWith(".processing") && age > 5 * 60 * 1000) fs.renameSync(file, file.replace(/\.\d+\.processing$/, ""));
+			} catch {}
+		}
+	}
+	cleanupMainRegistrations();
+	let rootNames: string[] = [];
+	try { rootNames = fs.readdirSync(INBOX_ROOT); } catch {}
+	const activeWorkers = (() => { try { return JSON.parse(fs.readFileSync(WORKER_REGISTRY, "utf8"))?.workers || {}; } catch { return {}; } })();
+	for (const name of rootNames) {
+		if (name.startsWith(".active-workers.json.") && name.endsWith(".tmp")) {
+			try {
+				const file = path.join(INBOX_ROOT, name);
+				if (now - fs.statSync(file).mtimeMs > 5 * 60 * 1000) fs.rmSync(file, { force: true });
+			} catch {}
+			continue;
+		}
+		if (name.startsWith(".") || ["main", "main-pending"].includes(name) || activeWorkers[name]) continue;
+		const dir = path.join(INBOX_ROOT, name);
+		try {
+			if (fs.statSync(dir).isDirectory() && now - fs.statSync(dir).mtimeMs > 24 * 60 * 60 * 1000) fs.rmSync(dir, { recursive: true, force: true });
+		} catch {}
+	}
+}
+
+export default function activate(pi: ExtensionAPI) {
+	piApi = pi;
 	if (SUBAGENT_TASK_ID) {
 		pi.registerTool({
 			name: "arm_notification_wait",
 			label: "Arm notification wait",
-			description: "Arm a bounded system-level wait lease for this durable worker after starting one external watcher. The current turn may then finish; agent-notify keeps the same worker process alive and a directed notify_agent.py event resumes it. This does not poll or start a watcher.",
+			description: "Arm a bounded wait lease for a worker-owned domain item after starting one external watcher. The matching directed event must carry this lease's task, itemKey, runId, and nonce.",
 			parameters: {
-				type: "object",
-				additionalProperties: false,
-				required: ["itemId", "reason", "wakeCondition", "producerPid", "producerMarkerPath"],
+				type: "object", additionalProperties: false,
+				required: ["itemKey", "reason", "wakeCondition", "producerPid", "producerMarkerPath"],
 				properties: {
-					itemId: { type: "string", pattern: "^[0-9]{6}$", description: "Exact six-digit item owned by this worker" },
-					reason: { type: "string", minLength: 1, maxLength: 300, description: "Why the worker must stay alive" },
-					wakeCondition: { type: "string", minLength: 1, maxLength: 500, description: "Exact external event/state that should wake the worker" },
+					itemKey: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,199}$", description: "Exact domain-neutral key owned by this worker" },
+					reason: { type: "string", minLength: 1, maxLength: 300 },
+					wakeCondition: { type: "string", minLength: 1, maxLength: 500 },
 					leaseSeconds: { type: "integer", minimum: MIN_WAIT_LEASE_SECONDS, maximum: MAX_WAIT_LEASE_SECONDS, default: 21600 },
-					checkpointPath: { type: "string", maxLength: 500, description: "Repository checkpoint/marker to re-read after wake" },
-					producerPid: { type: "integer", minimum: 2, description: "PID of the unique detached watcher/notifier" },
-					producerMarkerPath: { type: "string", minLength: 1, maxLength: 500, description: "Existing repository launch marker proving watcher identity" },
+					checkpointPath: { type: "string", maxLength: 500 },
+					producerPid: { type: "integer", minimum: 2 },
+					producerMarkerPath: { type: "string", minLength: 1, maxLength: 500 },
 				},
 			} as any,
-			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-				const itemId = String(params.itemId || "");
-				// Always revalidate the durable lease and its producer. An in-memory
-				// lease whose watcher died must not be returned as ALREADY_ARMED.
-				const existingLease = readWaitLease();
-				activeWaitLease = existingLease;
-				if (existingLease) {
-					// Idempotent re-arm: a worker may receive a duplicate/coalesced event
-					// while its original lease is still held. Treat the same task+item lease
-					// as success, otherwise workers can mistake a harmless duplicate for a
-					// fatal wait failure and exit before the next external event.
-					if (existingLease.taskId === SUBAGENT_TASK_ID && existingLease.itemId === itemId) {
-						activeWaitLease = existingLease;
-						return {
-							content: [{ type: "text", text: `ALREADY_ARMED: worker ${SUBAGENT_TASK_ID} already holds wait lease ${existingLease.leaseId} for item ${itemId}; finish this turn without foreground sleep/polling.` }],
-							details: { armed: true, alreadyArmed: true, ...existingLease },
-						};
-					}
-					return {
-						content: [{ type: "text", text: `REFUSED: worker ${SUBAGENT_TASK_ID} already has active wait lease ${existingLease.leaseId} for item ${existingLease.itemId}` }],
-						details: { armed: false, existingLease },
+			prepareArguments(args: any) {
+				if (!args || typeof args !== "object" || args.itemKey !== undefined || args.itemId === undefined) return args;
+				const { itemId, ...rest } = args;
+				return { ...rest, itemKey: String(itemId) };
+			},
+			async execute(_id, params: any, _signal, _update, ctx) {
+				const itemKey = String(params.itemKey || "");
+				if (!isSafeItemKey(itemKey)) return refused("itemKey is invalid", { itemKey });
+				const existing = readWaitLease(true);
+				activeWaitLease = existing;
+				if (existing) {
+					if (existing.taskId === SUBAGENT_TASK_ID && existing.itemKey === itemKey) return {
+						content: [{ type: "text", text: `ALREADY_ARMED: ${SUBAGENT_TASK_ID} holds lease ${existing.leaseId} for ${itemKey}.` }],
+						details: { armed: true, alreadyArmed: true, ...existing },
 					};
+					return refused(`worker already has lease for ${existing.itemKey}`, { existingLease: existing });
 				}
 				const registration = readWorkerRegistration(SUBAGENT_TASK_ID);
-				const registeredItems = Array.isArray(registration?.itemIds) ? registration.itemIds.map(String) : [];
-				if (!registration || !registeredItems.includes(itemId)) {
-					return {
-						content: [{ type: "text", text: `REFUSED: item ${itemId} is not owned by active worker ${SUBAGENT_TASK_ID}` }],
-						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, registeredItems },
-					};
-				}
-				if (path.resolve(registration.cwd || "") !== path.resolve(ctx.cwd)) {
-					return {
-						content: [{ type: "text", text: `REFUSED: worker cwd mismatch for ${SUBAGENT_TASK_ID}` }],
-						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
-					};
-				}
+				if (!registration || !registrationKeys(registration).includes(itemKey)) return refused(`itemKey ${itemKey} is not owned by active worker ${SUBAGENT_TASK_ID}`, { itemKey, registeredKeys: registrationKeys(registration) });
+				if (path.resolve(registration.cwd || "") !== path.resolve(ctx.cwd)) return refused("worker cwd mismatch", { itemKey });
 				const leaseSeconds = Number(params.leaseSeconds || 21600);
-				if (!Number.isInteger(leaseSeconds) || leaseSeconds < MIN_WAIT_LEASE_SECONDS || leaseSeconds > MAX_WAIT_LEASE_SECONDS) {
-					return {
-						content: [{ type: "text", text: `REFUSED: leaseSeconds must be an integer from ${MIN_WAIT_LEASE_SECONDS} to ${MAX_WAIT_LEASE_SECONDS}` }],
-						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
-					};
-				}
-				const resolveRepoPath = (raw: unknown, label: string): string | null => {
-					const resolved = path.resolve(ctx.cwd, String(raw || ""));
-					const rel = path.relative(path.resolve(ctx.cwd), resolved);
-					if (!raw || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-					return resolved;
+				if (!Number.isInteger(leaseSeconds) || leaseSeconds < MIN_WAIT_LEASE_SECONDS || leaseSeconds > MAX_WAIT_LEASE_SECONDS) return refused("leaseSeconds out of range", { itemKey });
+				const resolveRepoPath = (raw: unknown): string | null => {
+					if (!raw) return null;
+					const resolved = path.resolve(ctx.cwd, String(raw));
+					const relative = path.relative(path.resolve(ctx.cwd), resolved);
+					return relative.startsWith("..") || path.isAbsolute(relative) ? null : resolved;
 				};
-				let checkpointPath: string | undefined;
-				if (params.checkpointPath) {
-					checkpointPath = resolveRepoPath(params.checkpointPath, "checkpointPath") || undefined;
-					if (!checkpointPath) {
-						return {
-							content: [{ type: "text", text: `REFUSED: checkpointPath must stay under worker cwd ${path.resolve(ctx.cwd)}` }],
-							details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId },
-						};
-					}
-				}
+				const checkpointPath = params.checkpointPath ? resolveRepoPath(params.checkpointPath) : undefined;
+				if (params.checkpointPath && !checkpointPath) return refused("checkpointPath must stay under worker cwd", { itemKey });
+				const producerMarkerPath = resolveRepoPath(params.producerMarkerPath);
 				const producerPid = Number(params.producerPid);
-				const producerMarkerPath = resolveRepoPath(params.producerMarkerPath, "producerMarkerPath");
-				if (!Number.isInteger(producerPid) || producerPid < 2 || !producerMarkerPath || !fs.existsSync(producerMarkerPath)) {
-					return {
-						content: [{ type: "text", text: "REFUSED: wait lease requires a live detached watcher PID and an existing repository launch marker" }],
-						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath },
-					};
-				}
-				let producerMarker: any;
-				try { producerMarker = JSON.parse(fs.readFileSync(producerMarkerPath, "utf-8")); }
-				catch {
-					return {
-						content: [{ type: "text", text: "REFUSED: producer launch marker is not valid JSON" }],
-						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath },
-					};
-				}
-				const markerItem = String(producerMarker?.itemId ?? producerMarker?.item ?? "");
-				const markerTarget = String(producerMarker?.notifyTo ?? producerMarker?.to ?? "");
-				if (Number(producerMarker?.pid) !== producerPid || markerItem !== itemId || markerTarget !== SUBAGENT_TASK_ID) {
-					return {
-						content: [{ type: "text", text: "REFUSED: producer launch marker PID/item/notifyTo does not match this worker lease" }],
-						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath, producerMarker },
-					};
-				}
-				try { process.kill(producerPid, 0); }
-				catch {
-					return {
-						content: [{ type: "text", text: `REFUSED: watcher PID ${producerPid} is not alive` }],
-						details: { armed: false, taskId: SUBAGENT_TASK_ID, itemId, producerPid, producerMarkerPath },
-					};
-				}
+				if (!producerMarkerPath || !fs.existsSync(producerMarkerPath) || !pidAlive(producerPid)) return refused("wait lease requires a live producer and repository marker", { itemKey });
+				let marker: any;
+				try { marker = JSON.parse(fs.readFileSync(producerMarkerPath, "utf8")); } catch { return refused("producer marker is not valid JSON", { itemKey }); }
+				const markerItem = String(marker?.itemKey ?? marker?.itemId ?? marker?.item ?? "");
+				const markerTarget = String(marker?.notifyTo ?? marker?.to ?? "");
+				if (Number(marker?.pid) !== producerPid || markerItem !== itemKey || markerTarget !== SUBAGENT_TASK_ID) return refused("producer marker PID/itemKey/target mismatch", { itemKey });
 				const now = Date.now();
 				const lease: WaitLease = {
-					version: 1,
-					leaseId: randomUUID(),
-					taskId: SUBAGENT_TASK_ID,
-					itemId,
-					reason: String(params.reason),
-					wakeCondition: String(params.wakeCondition),
-					checkpointPath,
-					producerPid,
-					producerMarkerPath,
-					cwd: path.resolve(ctx.cwd),
-					pid: process.pid,
-					armedAt: now,
-					expiresAt: now + leaseSeconds * 1000,
+					version: 2, leaseId: randomUUID(), taskId: SUBAGENT_TASK_ID, itemKey,
+					itemId: /^\d{6}$/.test(itemKey) ? itemKey : undefined,
+					runId: currentRunId, nonce: currentNonce,
+					reason: String(params.reason), wakeCondition: String(params.wakeCondition), checkpointPath: checkpointPath || undefined,
+					producerPid, producerMarkerPath, cwd: path.resolve(ctx.cwd), pid: process.pid,
+					armedAt: now, expiresAt: now + leaseSeconds * 1000,
 				};
-				fs.mkdirSync(TRIGGER_DIR, { recursive: true });
-				const tmp = `${waitLeasePath()}.${process.pid}.tmp`;
-				fs.writeFileSync(tmp, JSON.stringify(lease), { encoding: "utf-8", mode: 0o600 });
-				fs.renameSync(tmp, waitLeasePath());
+				atomicWriteJson(waitLeasePath(), lease);
 				activeWaitLease = lease;
-				piLog(`wait lease armed task=${SUBAGENT_TASK_ID} item=${itemId} lease=${lease.leaseId} seconds=${leaseSeconds}`);
+				log(`wait lease armed task=${SUBAGENT_TASK_ID} itemKey=${itemKey} runId=${lease.runId}`);
 				return {
-					content: [{ type: "text", text: `ARMED: ${SUBAGENT_TASK_ID} remains alive for directed notifications about item ${itemId} until ${new Date(lease.expiresAt).toISOString()}. Finish this turn without foreground sleep/polling; the extension will hold the worker at agent_end.` }],
+					content: [{ type: "text", text: `ARMED: ${SUBAGENT_TASK_ID} remains alive for ${itemKey} until ${new Date(lease.expiresAt).toISOString()}. The notifier will read runId/nonce from the lease; finish without foreground polling.` }],
 					details: { armed: true, ...lease },
 				};
 			},
 		});
 	}
 
-	// 启动监听（session 开始时）
 	pi.on("session_start", async (_event, ctx) => {
-		// Restore only a structurally valid, unexpired lease for this exact task.
-		// readWaitLease removes malformed/expired leftovers from a prior crash.
-		if (SUBAGENT_TASK_ID) activeWaitLease = readWaitLease();
-		if (!SUBAGENT_TASK_ID) {
-			sessionId = String(ctx.sessionManager?.getSessionId?.() || process.pid);
-			sessionScope = path.resolve(ctx.cwd);
-			const key = safeSessionKey(sessionId);
-			TRIGGER_DIR = path.join(TRIGGER_DIR_BASE, "main", key);
-			PENDING_SCOPE_DIR = path.join(MAIN_PENDING_DIR, scopeKey(sessionScope));
-			sessionRegistryFile = path.join(MAIN_REGISTRY_DIR, `${key}.json`);
-			writeSessionRegistration(ctx);
-			sessionHeartbeat = setInterval(() => writeSessionRegistration(ctx), MAIN_HEARTBEAT_MS);
-			sessionHeartbeat.unref?.();
-		}
-		const watchDirs = [TRIGGER_DIR, ...(!SUBAGENT_TASK_ID && PENDING_SCOPE_DIR ? [PENDING_SCOPE_DIR] : [])];
-		for (const dir of watchDirs) {
-			try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* ignore */ }
-		}
-
-		// fs.watch 作为第一通道；无活跃主会话时的 scope pending 也会在启动后消费。
-		const dirWatchers: fs.FSWatcher[] = [];
-		for (const dir of watchDirs) {
-			try {
-				const watcher = fs.watch(dir, () => scheduleFlush().catch((e) => piLog(`watch err ${e}`)));
-				watcher.on("error", () => { /* 定时轮询兜底 */ });
-				dirWatchers.push(watcher);
-			} catch (e) { piLog(`watch setup err ${dir}: ${e}`); }
-		}
-
-		// 定时轮询兜底（fs.watch 在 macOS 目录场景可能漏事件）
-		if (!scanTimer) {
-			scanTimer = setInterval(() => {
-				scheduleFlush().catch((e) => piLog(`poll err ${e}`));
-			}, SCAN_INTERVAL_MS);
-			if (scanTimer.unref) scanTimer.unref();
-		}
-
 		currentCtx = ctx;
-		if (ctx.hasUI) {
-			ctx.ui.notify(`agent-notify v3: watching ${TRIGGER_DIR}`, "info");
+		if (SUBAGENT_TASK_ID) {
+			currentSessionId = String(ctx.sessionManager?.getSessionId?.() || SUBAGENT_TASK_ID);
+			const identity = mainIdentity(`worker:${SUBAGENT_TASK_ID}:${currentSessionId}`);
+			currentRunId = identity.runId;
+			currentNonce = identity.nonce;
+			inboxDir = path.join(INBOX_ROOT, SUBAGENT_TASK_ID);
+			activeWaitLease = readWaitLease(false);
+			if (activeWaitLease) {
+				currentRunId = activeWaitLease.runId;
+				currentNonce = activeWaitLease.nonce;
+			}
+		} else {
+			currentSessionId = String(ctx.sessionManager?.getSessionId?.() || process.pid);
+			const identity = mainIdentity(currentSessionId);
+			currentRunId = identity.runId;
+			currentNonce = identity.nonce;
+			inboxDir = path.join(INBOX_ROOT, "main", currentSessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160));
+			pendingScopeDir = path.join(MAIN_PENDING_DIR, scopeKey(ctx.cwd));
+			sessionRegistryFile = path.join(MAIN_REGISTRY_DIR, `${currentSessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160)}.json`);
+			writeSessionRegistration(ctx);
+			heartbeatTimer = setInterval(() => writeSessionRegistration(ctx), MAIN_HEARTBEAT_MS);
+			heartbeatTimer.unref?.();
 		}
-
-		// reload/new/resume 会销毁旧 session runtime。清理旧 timer 很重要：
-		// 否则旧 timer 会继续调用旧 pi.sendUserMessage，触发 stale ctx，导致通知丢失。
-		pi.on("session_shutdown", () => {
-			if (activeWaitLease || (SUBAGENT_TASK_ID && fs.existsSync(waitLeasePath()))) {
-				clearWaitLease("session_shutdown");
-			}
-			for (const watcher of dirWatchers) {
-				try { watcher.close(); } catch (_) { /* ignore */ }
-			}
-			if (scanTimer) {
-				clearInterval(scanTimer);
-				scanTimer = null;
-			}
-			if (batchTimer) {
-				clearTimeout(batchTimer);
-				batchTimer = null;
-			}
-			removeSessionRegistration();
-			// reload/shutdown 时把尚未注入的内存事件写回 scope/worker inbox，避免静默丢失。
-			const retryDir = (!SUBAGENT_TASK_ID && PENDING_SCOPE_DIR) ? PENDING_SCOPE_DIR : TRIGGER_DIR;
-			for (const event of pendingEvents) {
-				try {
-					fs.mkdirSync(retryDir, { recursive: true });
-					fs.writeFileSync(path.join(retryDir, `evt-requeue-${Date.now()}-${Math.random().toString(16).slice(2)}.json`), JSON.stringify(event), "utf-8");
-				} catch (_) { /* leave shutdown best-effort */ }
-			}
-			pendingEvents = [];
-			if (waitLeaseTimer) {
-				clearTimeout(waitLeaseTimer);
-				waitLeaseTimer = null;
-			}
-			waitLeaseResolve = null;
-			activeWaitLease = null;
-			currentCtx = null;
-		});
+		for (const dir of [inboxDir, OUTBOX_DIR, QUARANTINE_DIR, ...(!SUBAGENT_TASK_ID && pendingScopeDir ? [pendingScopeDir] : [])]) ensurePrivateDir(dir);
+		if (SUBAGENT_TASK_ID) {
+			writeWorkerReceiverIdentity(ctx);
+			heartbeatTimer = setInterval(() => writeWorkerReceiverIdentity(ctx), MAIN_HEARTBEAT_MS);
+			heartbeatTimer.unref?.();
+		}
+		loadDedup();
+		cleanupStaleFiles();
+		for (const dir of [inboxDir, OUTBOX_DIR, ...(!SUBAGENT_TASK_ID && pendingScopeDir ? [pendingScopeDir] : [])]) {
+			try {
+				const watcher = fs.watch(dir, () => scheduleFlush().catch((error) => log(`watch flush failed: ${error}`)));
+				watcher.on("error", () => {});
+				watchers.push(watcher);
+			} catch (error) { log(`watch setup failed for ${dir}: ${error}`); }
+		}
+		scanTimer = setInterval(() => scheduleFlush().catch((error) => log(`poll failed: ${error}`)), SCAN_INTERVAL_MS);
+		scanTimer.unref?.();
+		if (ctx.hasUI) ctx.ui.setStatus("agent-notify", `notify: ${SUBAGENT_TASK_ID || currentSessionId.slice(0, 8)}`);
+		await scheduleFlush();
 	});
 
-	// A queued follow-up has actually been consumed only when a new agent run
-	// starts. Resetting at send time is too early; never resetting leaves later
-	// events stuck behind "followUp already outstanding" forever.
 	pi.on("agent_start", async () => {
 		if (!followUpOutstanding) return;
 		followUpOutstanding = false;
-		piLog(`followUp consumed; queue reopened task=${SUBAGENT_TASK_ID || "main"}`);
-		if (pendingEvents.length > 0) scheduleFlush().catch((e) => piLog(`post-consume flush err ${e}`));
+		if (pendingEvents.length) await scheduleFlush();
 	});
 
-	// Durable workers run as `pi --mode json -p` and otherwise exit immediately
-	// after agent_settled. Hold agent_end (before settled is emitted) only when
-	// this worker explicitly armed a bounded lease. A directed event is queued
-	// as a follow-up, then releases this handler so the same session continues.
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!SUBAGENT_TASK_ID) return;
-		try {
-			await collectFiles();
-			if (pendingEvents.length > 0 && !followUpOutstanding) {
-				if (batchTimer) {
-					clearTimeout(batchTimer);
-					batchTimer = null;
-				}
-				await flushBatch();
-			}
-		} catch (e) {
-			piLog(`agent_end preflush err ${e}`);
-		}
-		let lease = readWaitLease();
+		collectFiles();
+		if (pendingEvents.length && !followUpOutstanding) await flushBatch();
+		let lease = readWaitLease(true);
 		if (!lease) lease = rearmReleasedLeaseIfProducerAlive();
 		activeWaitLease = lease;
 		if (!lease) return;
-		if (followUpOutstanding) {
-			// A follow-up can be queued while this run is busy. The first agent_end
-			// should yield to a genuinely pending message, but after that message is
-			// consumed some hosts do not emit another observable agent_start before
-			// the next agent_end. Never let the stale flag bypass an armed lease.
-			if (ctx.hasPendingMessages()) {
-				piLog(`wait lease deferred for pending followUp task=${SUBAGENT_TASK_ID} item=${lease.itemId}`);
-				return;
-			}
-			followUpOutstanding = false;
-			piLog(`cleared stale followUpOutstanding before wait hold task=${SUBAGENT_TASK_ID}`);
-		}
-		activeWaitLease = lease;
+		if (followUpOutstanding && ctx.hasPendingMessages?.()) return;
+		followUpOutstanding = false;
 		const remaining = lease.expiresAt - Date.now();
-		if (remaining <= 0) {
-			clearWaitLease("expired_before_hold");
-			return;
-		}
-		piLog(`wait lease holding task=${SUBAGENT_TASK_ID} item=${lease.itemId} lease=${lease.leaseId}`);
+		if (remaining <= 0) { clearWaitLease("expired_before_hold"); return; }
 		await new Promise<void>((resolve) => {
 			waitLeaseResolve = resolve;
 			waitLeaseTimer = setTimeout(() => {
-				const body = `[脚本通知] 🟡[agent-notify] [item ${lease.itemId}] 等待租约已到期。请重新读取权威状态与 ${lease.checkpointPath || "checkpoint"}，决定续等、推进或上报；不要前台 sleep/轮询。`;
 				try {
-					pi.sendUserMessage(body, { deliverAs: "followUp" });
+					pi.sendUserMessage(`[agent-notify] Wait lease expired for ${lease.itemKey}. Re-read authoritative state and ${lease.checkpointPath || "the checkpoint"}; decide whether to continue, re-arm, or report.`, { deliverAs: "followUp" });
 					followUpOutstanding = true;
 					clearWaitLease("lease_timeout_followup");
-				} catch (e) {
-					piLog(`lease timeout injection failed ${e}`);
-					clearWaitLease("lease_timeout_inject_failed");
-				}
+				} catch (error) { log(`lease timeout injection failed: ${error}`); clearWaitLease("lease_timeout_failed"); }
 			}, remaining);
 		});
 	});
 
-	function piLog(msg: string) {
-		try {
-			fs.appendFileSync(
-				"/tmp/agent-notify.log",
-				`[${new Date().toISOString()}] ${msg}\n`,
-			);
-		} catch (e) {
-			/* ignore */
+	pi.on("session_shutdown", (event: any) => {
+		for (const watcher of watchers) try { watcher.close(); } catch {}
+		watchers = [];
+		if (scanTimer) clearInterval(scanTimer);
+		if (batchTimer) clearTimeout(batchTimer);
+		if (heartbeatTimer) clearInterval(heartbeatTimer);
+		scanTimer = batchTimer = heartbeatTimer = null;
+		if (SUBAGENT_TASK_ID && (activeWaitLease || fs.existsSync(waitLeasePath()))) clearWaitLease("session_shutdown");
+		removeSessionRegistration();
+		removeWorkerReceiverIdentity();
+		if (!SUBAGENT_TASK_ID && event?.reason !== "reload") {
+			try { (globalThis as any).__pi_agent_notify_main_identities__?.delete(currentSessionId); } catch {}
 		}
-	}
-
-	// 有事件时：先合并缓冲，等 BATCH_WINDOW 后一次性处理
-	async function scheduleFlush() {
-		try {
-			await collectFiles();
-		} catch (e) {
-			piLog(`collect err ${e}`);
+		// Version-2 events remain in the durable outbox. Requeue inbox-only legacy
+		// events atomically so shutdown/new/resume cannot silently discard them.
+		for (const pending of pendingEvents) {
+			if (pending._outboxPath) continue;
+			try { atomicWriteJson(path.join(inboxDir, `evt-requeue-${pending.eventId}.json`), { ...pending, _outboxPath: undefined }); } catch {}
 		}
-		if (pendingEvents.length === 0) return;
-		if (!batchTimer) {
-			batchTimer = setTimeout(() => {
-				batchTimer = null;
-				flushBatch().catch((e) => piLog(`batch err ${e}`));
-			}, BATCH_WINDOW_MS);
-			if (batchTimer.unref) batchTimer.unref();
-		}
-	}
-
-	// 读专属 inbox 与 scope pending，加入合并缓冲（原子 rename，避免并发）。
-	async function collectFiles() {
-		const dirs = [TRIGGER_DIR, ...(!SUBAGENT_TASK_ID && PENDING_SCOPE_DIR ? [PENDING_SCOPE_DIR] : [])];
-		for (const dir of dirs) {
-			let files: string[];
-			try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")); }
-			catch (_) { continue; }
-			for (const f of files) {
-				const full = path.join(dir, f);
-				const proc = full + ".processing";
-				try {
-					fs.renameSync(full, proc);
-					const raw = fs.readFileSync(proc, "utf-8");
-					const obj = JSON.parse(raw);
-					if (obj && (obj.message || obj.text)) {
-						pendingEvents.push({ level: obj.level || "yellow", source: obj.source || "script",
-							message: obj.message || obj.text, itemId: obj.itemId || undefined,
-							ts: typeof obj.ts === "number" ? obj.ts : undefined });
-					}
-					fs.rmSync(proc, { force: true });
-				} catch (e) {
-					// rename 成功但读取/解析失败时保留 .processing 供人工审计，不静默删除。
-					piLog(`collect failed ${proc}: ${e}`);
-				}
-			}
-		}
-	}
-
-	// 去重 key：source + itemId + 消息前 40 字符（同类事件视为重复）
-	function dedupKey(e: NotifyEvent): string {
-		// red 按 item+状态消息跨 watcher 去重，避免不同检测器对同一人工阻塞重复注入。
-		const source = e.level === "red" ? "*" : e.source;
-		return `${source}|${e.itemId || "-"}|${e.message.slice(0, 40)}`;
-	}
-
-	// 录屏告警是瞬时状态：事件排队期间若健康快照已恢复，不应再注入一条过期红警。
-	function isObsoleteRecordingAlert(e: NotifyEvent, now: number): boolean {
-		if (e.source !== "recording_supervisor" || e.level !== "red") return false;
-		const eventMs = e.ts ? (e.ts < 10_000_000_000 ? e.ts * 1000 : e.ts) : 0;
-		if (eventMs && now - eventMs > 3 * 60 * 1000) return true;
-		if (!e.itemId || !currentCtx?.cwd) return false;
-		try {
-			const p = path.join(currentCtx.cwd, "docs", "recording_health.json");
-			const h = JSON.parse(fs.readFileSync(p, "utf-8"));
-			const generated = Date.parse(h.generatedAt || "");
-			const inst = h.instances?.[String(e.itemId)];
-			return Number.isFinite(generated) && now - generated < 120_000 && inst?.state === "running";
-		} catch (_) {
-			return false;
-		}
-	}
-
-	// 合并缓冲到期：丢弃过期状态 → 去重 → 合成一条 → 注入
-	async function flushBatch() {
-		if (pendingEvents.length === 0) return;
-		const batch = pendingEvents;
 		pendingEvents = [];
+		pendingEventIds.clear();
+		followUpOutstanding = false;
+		pendingScopeDir = "";
+		if (currentCtx?.hasUI) currentCtx.ui.setStatus("agent-notify", undefined);
+		currentCtx = null;
+	});
+}
 
-		// 去重：同 key 冷却期内跳过
-		const now = Date.now();
-		const unique: NotifyEvent[] = [];
-		for (const e of batch) {
-			if (isObsoleteRecordingAlert(e, now)) {
-				piLog(`stale recording alert skip ${e.itemId || "-"}: ${e.message.slice(0, 80)}`);
-				continue;
-			}
-			const key = dedupKey(e);
-			const last = dedupCache.get(key) || 0;
-			if (now - last < DEDUP_COOLDOWN_MS) {
-				piLog(`dedup skip ${key.slice(0, 80)}`);
-				continue;
-			}
-			// red 同样必须去重；真正的新状态由消息前缀/状态类形成不同 key。
-			dedupCache.set(key, now);
-			unique.push(e);
-		}
-		if (unique.length === 0) return;
-
-		// 合成一条注入消息
-		const parts = unique.map((e) => {
-			const item = e.itemId ? ` [item ${e.itemId}]` : "";
-			const lvl = e.level === "red" ? "🔴" : e.level === "green" ? "🟢" : "🟡";
-			return `${lvl}[${e.source}]${item} ${e.message}`;
-		});
-		const text = parts.join("\n");
-		const body = `[脚本通知] ${text}\n\n（来自自动监控脚本，请判断是否需要处理并自行推进，无需告知用户；若需用户拍板则红色提醒。）`;
-
-		let injected = false;
-		try {
-			if (currentCtx?.isIdle && currentCtx.isIdle()) {
-				pi.sendUserMessage(body);
-				piLog(`injected(${unique.length}条合并): ${text.slice(0, 120)}`);
-			} else if (!followUpOutstanding) {
-				// busy：全局只允许一条已排队 followUp。
-				pi.sendUserMessage(body, { deliverAs: "followUp" });
-				followUpOutstanding = true;
-				piLog(`injected(followUp,${unique.length}条合并): ${text.slice(0, 120)}`);
-			} else {
-				// 已有 followUp 等待消费：撤销 dedup 占位并留在内存，继续与后续事件合并。
-				for (const event of unique) dedupCache.delete(dedupKey(event));
-				pendingEvents.unshift(...unique);
-				piLog(`followUp already outstanding; retained ${unique.length} event(s)`);
-				return;
-			}
-			injected = true;
-			if (SUBAGENT_TASK_ID && (activeWaitLease || readWaitLease())) clearWaitLease("directed_event_injected");
-		} catch (e) {
-			// 注入失败：撤销本轮 dedup 占位并放回缓冲，下一轮重试。
-			for (const event of unique) dedupCache.delete(dedupKey(event));
-			pendingEvents.unshift(...unique);
-			piLog(`inject failed; requeued ${unique.length}: ${e}`);
-		}
-
-		// red 事件仅在成功注入后额外 TUI 高亮；主会话语音由 sender 去重后负责。
-		if (injected && unique.some((e) => e.level === "red")) {
-			try {
-				if (currentCtx?.ui) currentCtx.ui.notify("🔴 脚本事件需用户拍板（见对话）", "error");
-			} catch (e) {
-				piLog(`ui notify err ${e}`);
-			}
-		}
-	}
+function refused(message: string, details: Record<string, unknown>) {
+	return { content: [{ type: "text", text: `REFUSED: ${message}` }], details: { armed: false, taskId: SUBAGENT_TASK_ID, ...details } };
 }

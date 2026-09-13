@@ -1,79 +1,138 @@
 # pi-agent-notify
 
-Script → agent direct notification channel for [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent). External scripts (watchers, pollers, cron) write JSON events to a trigger dir; the extension batches, dedups and injects them into the active agent session as **user messages**, so the agent can act on them autonomously instead of waiting for the user to relay.
+Fail-closed external event → exact pi session/worker delivery. Watchers publish a versioned event; the extension validates target identity, run nonce, item ownership, expiry, sequence and dedup state before injecting a user/follow-up message.
 
-## Why this exists
+## Properties
 
-Long-running automation (e.g. TalentsAI 出题流水线) has many background watcher scripts that detect state changes (evaluation done, recording disconnected, review returned). Previously they could only alert the user (voice/sound) or write log files — the agent had to be manually told. This extension closes the loop: **scripts talk directly to the agent session**.
-
-## Features
-
-| | |
-|---|---|
-| **Batch buffer** | Events collected over a 15s window are merged into one injection (no per-event spam) |
-| **Dedup cache** | green/yellow use source+itemId+message prefix; red ignores source for cross-watcher dedup. Same state is injected at most once per 30min |
-| **Level semantics** | `green` = progress memo · `yellow` = agent-handleable event (default) · `red` = needs user decision (TUI highlight + macOS voice for main-session alerts; still deduped to prevent repeated stale alerts) |
-| **Identity-aware** | Each main session has an inbox under `/tmp/pi-agent-notify/main/{sessionId}/`; when no main session is live, events stay in `main-pending/{cwdHash}/`. Subagents listen on `/tmp/pi-agent-notify/{taskId}/` |
-| **Busy-safe** | Globally at most one `followUp` is queued while busy; `agent_start` marks that follow-up consumed and reopens the queue, preventing a stale outstanding flag from buffering events forever |
-| **Durable wait lease** | A subagent can call `arm_notification_wait`; the extension holds `agent_end` before `agent_settled`, so `pi --mode json -p` stays alive without a foreground sleep/poller. A directed event consumes the lease and resumes the same session |
+- Domain-neutral `itemKey`: examples `mission:hkg_super_v13`, `alpha:KPO237EN`, `ci:run-42`, and legacy six-digit item IDs.
+- Exact routing: `targetKind + targetId + runId + nonce`; ambiguous same-cwd main sessions are rejected.
+- Busy-worker delivery uses a short-lived `.receiver-identity.json`; durable watcher handoffs additionally require `arm_notification_wait` and a live producer marker.
+- Protocol-v1 inbox events remain readable during migration, while all new senders emit version-2 envelopes.
+- Monotonic per-stream sequence, event-ID + semantic dedup, TTL/future-skew rejection and quarantine.
+- Concurrency-safe sender state and durable outbox via lock + fsync + atomic rename.
+- Worker ownership registry is supplied by `pi-subagent-durable`; its writes are also locked/atomic and lease-token checked.
+- Notifications are wake-up hints, never authoritative proof. Resumed agents must re-read the source system.
 
 ## Install
 
 ```bash
-# from a local checkout (this package)
-pi install ./pi-agent-notify          # global
-pi install -l ./pi-agent-notify       # project-local
-
-# or from git
-pi install git:github.com/roshameow/pi-agent-notify
+pi install ./pi-agent-notify
+# settings.json may also load extensions/index.ts directly.
 ```
 
-## Usage (external scripts)
+Node 20+ and pi 0.80+ are required.
 
-Write a JSON file to the trigger dir:
+## Sender CLI
+
+Always prefer the companion sender instead of manually writing inbox files:
 
 ```bash
-# companion script (recommended)
-python3 scripts/notify_agent.py "evaluation done for item 167161" --level yellow --source evaluation --item 167161
-python3 scripts/notify_agent.py "recording disconnected, please restore" --level red --source recwatch --item 174366
-
-# directed to a specific subagent: item must match its active-worker ownership
-python3 scripts/notify_agent.py "v6 models ready, continue grading" \
-  --item 168373 --to task-mtj6zcy5-x0k9 --level yellow
+python3 scripts/notify_agent.py send \
+  "QuantNight mission reached terminal item states" \
+  --item mission:hkg_super_v13 \
+  --to task-mtz... \
+  --state quantnight.mission.terminal \
+  --source quantnight-watcher \
+  --level yellow
 ```
 
-Event file shape (written by scripts):
+A watcher can create a domain event and ask the sender to normalize/route it:
+
+```bash
+python3 scripts/notify_agent.py send --event-file /path/to/event.json
+# watcher that must wake an agent_end-held worker:
+python3 scripts/notify_agent.py send --event-file /path/to/event.json --require-lease
+```
+
+Input event shape:
 
 ```json
-{ "level": "yellow", "source": "reviewwatch", "message": "...", "itemId": "167161", "ts": 1788298000123 }
+{
+  "schemaVersion": 1,
+  "eventId": "quantnight:hkg-v13:terminal:abc123",
+  "producer": "quantnight-watcher",
+  "occurredAt": "2026-09-13T12:30:00Z",
+  "expiresAt": "2026-09-13T13:30:00Z",
+  "itemKey": "mission:hkg_super_v13",
+  "target": {"taskId": "task-mtz..."},
+  "eventType": "quantnight.mission.terminal",
+  "payload": {"terminal": true}
+}
 ```
 
-- Trigger dir: `/tmp/pi-agent-notify/` (override with `PI_AGENT_NOTIFY_DIR` env)
-- Level `red` events trigger `ctx.ui.notify` highlight and are deduped across watcher sources by item/message prefix for 30min
-- Stale `recording_supervisor` red events are dropped after 3min, or when a fresh `docs/recording_health.json` already says the item is `running`
-- Consumed event files are removed after processing
+The sender resolves the active worker registration and current receiver identity. For a durable watcher handoff, add `--require-lease`; it then waits for and binds to the exact lease. It allocates a monotonic sequence and atomically writes the normalized v2 envelope to `~/.pi/agent/agent-notify/outbox/`. Re-sending the same `eventId` is idempotent (`alreadySent=true`). Expired, unsafe, unowned or ambiguous events fail closed.
 
-## Bidirectional communication / directed subagent wake-up
+Legacy invocation without the `send` word remains accepted:
 
-The channel is bidirectional, but each session has its own directory:
+```bash
+python3 scripts/notify_agent.py "review ready" --item 168373 --to task-...
+```
 
-- Main session → worker: `notify_agent.py --item <ownedItem> --to <taskId> "msg"` writes to `/tmp/pi-agent-notify/<taskId>/`. A present durable registry is checked fail-closed: an item/worker ownership mismatch is refused.
-- Worker → main session: omit `--to`; the event is routed by `cwd + itemId` to the matching main-session inbox. If no matching session is live, it is durably queued under `main-pending/{cwdHash}/` for the next matching session.
-- Worker → itself: use `--to "$PI_SUBAGENT_TASK_ID"`; this does **not** appear in the main session.
+## Durable worker protocol
 
-### Keep an unfinished worker alive without foreground waiting
+The delegated task text must declare ownership explicitly:
 
-A durable worker launched as `pi --mode json -p` normally exits after `agent_settled`. For an unfinished workflow that must continue after an external state change:
+```text
+itemKey: mission:hkg_super_v13
+```
 
-1. Start exactly one bounded external watcher. It must send a directed event with the exact `--item` and current `--to "$PI_SUBAGENT_TASK_ID"` and persist its marker/log outside `/tmp`.
-2. Verify the watcher PID/launch marker, then call `arm_notification_wait` with `itemId`, a precise `wakeCondition`, bounded `leaseSeconds`, the checkpoint path, `producerPid`, and the existing repository `producerMarkerPath`. The tool rejects a missing/dead producer, so a lease cannot silently become a watcher-free wait.
-3. Finish the current model turn normally. Do not hold a Bash tool call with `sleep`, polling, or `wait_for_change`.
-4. The extension's async `agent_end` handler keeps the process and active-worker registration alive. When the inbox event arrives, it queues one follow-up, removes the lease, releases `agent_end`, and the same session continues.
-5. The next `agent_start` clears the outstanding-follow-up gate. If the worker still needs an external wait after processing, it must re-check authoritative state and explicitly arm a new lease.
+Then:
 
-The lease file is `/tmp/pi-agent-notify/<taskId>/.notification-wait-lease`. It is bounded to 30 seconds–24 hours. Expiry injects a self-check follow-up rather than silently declaring success. Terminal/delivered workers must not arm a lease; they should exit and unregister normally.
+1. Start exactly one bounded external watcher.
+2. Persist a repository-local JSON marker containing:
+   ```json
+   {"pid": 12345, "itemKey": "mission:hkg_super_v13", "notifyTo": "task-mtz..."}
+   ```
+3. Verify the PID is live.
+4. Call `arm_notification_wait` with `itemKey`, precise `wakeCondition`, bounded `leaseSeconds`, `producerPid`, repository-relative `producerMarkerPath`, and optional checkpoint path.
+5. Finish the current turn. Do not keep a foreground tool blocked by sleep/polling.
+6. The matching directed event consumes the lease and resumes the same session. On resume, query authoritative state before acting.
+7. Normally the worker explicitly arms its next wait. As a bounded safety net, if the released lease's original producer is still alive and the turn ends without re-arming, the extension restores that same lease **once**, never beyond its original expiry. Terminal/dead-producer waits are not restored.
 
-A directed notification is consumed only while the target pi process is alive and has this extension loaded. `subagent_reload` is a control/resume operation, not a worker-to-main return channel. If a subagent process does not load project extensions, it must use the documented fallback; otherwise the extension consumes the event automatically.
+The lease lives at `${PI_AGENT_NOTIFY_DIR:-/tmp/pi-agent-notify}/<taskId>/.notification-wait-lease`. It is bounded to 30 seconds–24 hours. Missing/dead producer, item mismatch, cwd escape, stale ownership heartbeat or wrong nonce causes refusal.
+
+## Main-session routing
+
+For a main session, pass an exact `target.sessionId` in the event or provide `cwd`. Cwd routing succeeds only when exactly one live registered main session matches. Multiple same-cwd sessions are intentionally rejected; there is no “pick newest” fallback.
+
+## Envelope v2
+
+```json
+{
+  "version": 2,
+  "eventId": "...",
+  "runId": "run-...",
+  "itemKey": "mission:...",
+  "targetKind": "worker",
+  "targetId": "task-...",
+  "state": "quantnight.mission.terminal",
+  "sequence": 4,
+  "occurredAt": "...",
+  "expiresAt": "...",
+  "nonce": "...",
+  "level": "yellow",
+  "source": "quantnight-watcher",
+  "message": "...",
+  "actionable": true,
+  "terminal": true
+}
+```
+
+`green` is a passive memo. `yellow` is agent-actionable. `red` indicates a user decision/attention request; it is still deduped.
+
+## State and cleanup
+
+- Inbox root: `${PI_AGENT_NOTIFY_DIR:-/tmp/pi-agent-notify}`
+- Durable outbox/dedup/log: `${PI_AGENT_NOTIFY_STATE_DIR:-~/.pi/agent/agent-notify}`
+- Active workers: `<inbox>/.active-workers.json`
+- Main registrations: `<inbox>/.main-sessions/*.json`
+- Invalid envelopes: durable `quarantine/` with reason files
+
+Stale temp/processing files, dead main registrations and orphan worker inboxes are cleaned conservatively. Live workers are never removed by this cleanup.
+
+## Protocol-v1 migration compatibility
+
+The extension can ingest old `{level, source, message, itemId, ts}` files from an exact worker/main inbox. Worker ownership is still enforced and missing v2 identity is bound to that live receiver only. Main registrations expose a legacy numeric `heartbeat` alias, and a main session drains the legacy `main-pending/<cwdHash>` directory. This compatibility is an ingestion bridge; new code should always use the generic sender and v2 envelope.
 
 ## Development
 
@@ -81,13 +140,4 @@ A directed notification is consumed only while the target pi process is alive an
 npm run check
 ```
 
-The test bundles the extension and verifies: stale-lease cleanup, explicit arm, duplicate/path/item rejection, unresolved `agent_end`, directed follow-up wake, lease consumption, `agent_start` queue reopening, and shutdown cleanup.
-
-## Logging
-
-All injections are logged to `/tmp/agent-notify.log` (dedup skips, inject results).
-
-## Requirements
-
-- pi `>= 0.80`
-- Node `>= 20`
+Tests cover generic item keys, protocol-v1 worker/main ingestion, legacy pending routing, busy-worker receiver identity, stale lease cleanup, ownership/path refusal, exact nonce routing, one-time auto-rearm, replay/expiry rejection, sender idempotence and concurrent sequence allocation.
