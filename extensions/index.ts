@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -30,6 +31,9 @@ const MAX_AGE_BY_LEVEL: Record<string, number> = {
 };
 const SAFE_ITEM_KEY = /^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,199}$/;
 const SAFE_TARGET_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const SENDER_SCRIPT = path.resolve(
+	process.env.PI_AGENT_NOTIFY_SENDER || path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/notify_agent.py"),
+);
 
 interface NotifyEvent {
 	version: 2;
@@ -646,6 +650,52 @@ function cleanupStaleFiles(): void {
 
 export default function activate(pi: ExtensionAPI) {
 	piApi = pi;
+	if (!SUBAGENT_TASK_ID) {
+		pi.registerTool({
+			name: "notify_subagent",
+			label: "Notify subagent",
+			description: "Send a fail-closed follow-up instruction to a live durable subagent through pi-agent-notify. Defaults to the worker's automatic control itemKey worker:<taskId>. Use this instead of subagent_reload for ordinary steering; reload is for finished/paused sessions or runtime/tool refresh.",
+			promptSnippet: "Send follow-up instructions to a live durable subagent without restarting it",
+			promptGuidelines: [
+				"Use notify_subagent instead of subagent_reload when only giving new instructions to a live worker; use subagent_reload only to resume a finished/paused session or load changed tools, extensions, or MCP runtime.",
+			],
+			parameters: {
+				type: "object", additionalProperties: false,
+				required: ["taskId", "message"],
+				properties: {
+					taskId: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$" },
+					message: { type: "string", minLength: 1, maxLength: 12000 },
+					itemKey: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,199}$", description: "Optional domain key; defaults to worker:<taskId>" },
+					state: { type: "string", minLength: 1, maxLength: 120, default: "main.followup" },
+					level: { type: "string", enum: ["yellow", "red"], default: "yellow" },
+					requireLease: { type: "boolean", default: false, description: "Require an armed durable wait lease for watcher handoff messages" },
+				},
+			} as any,
+			async execute(_id, params: any, signal) {
+				const taskId = String(params.taskId || "");
+				const itemKey = String(params.itemKey || `worker:${taskId}`);
+				if (!SAFE_TARGET_ID.test(taskId)) throw new Error(`unsafe taskId: ${taskId}`);
+				if (!isSafeItemKey(itemKey)) throw new Error(`unsafe itemKey: ${itemKey}`);
+				if (!fs.existsSync(SENDER_SCRIPT)) throw new Error(`notify sender not found: ${SENDER_SCRIPT}`);
+				const args = [
+					SENDER_SCRIPT, "send", String(params.message),
+					"--item", itemKey, "--to", taskId,
+					"--state", String(params.state || "main.followup"),
+					"--source", "main-agent", "--level", String(params.level || "yellow"),
+				];
+				if (params.requireLease) args.push("--require-lease");
+				const result = await pi.exec("python3", args, { signal, timeout: 70000 });
+				if (result.code !== 0) throw new Error((result.stderr || result.stdout || "notify sender failed").trim());
+				let details: any;
+				try { details = JSON.parse(result.stdout); }
+				catch { details = { ok: true, raw: result.stdout.trim() }; }
+				return {
+					content: [{ type: "text", text: `Sent follow-up to ${taskId} via ${itemKey}.` }],
+					details,
+				};
+			},
+		});
+	}
 	if (SUBAGENT_TASK_ID) {
 		pi.registerTool({
 			name: "arm_notification_wait",

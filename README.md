@@ -22,9 +22,25 @@ pi install ./pi-agent-notify
 
 Node 20+ and pi 0.80+ are required.
 
+## Main-agent tool
+
+In a main Pi session the extension registers `notify_subagent`. It sends an ordinary follow-up to a live durable worker without restarting it:
+
+```json
+{
+  "taskId": "task-mtz...",
+  "message": "Re-read the updated skill and continue",
+  "itemKey": "alpha:KPO237EN"
+}
+```
+
+`itemKey` is optional when used with current `pi-subagent-durable`: every worker automatically owns `worker:<taskId>`, which the tool uses by default. Pass the explicit domain itemKey for watcher/domain-specific messages. Set `requireLease=true` only for an armed durable watcher handoff.
+
+Use `notify_subagent` for normal steering. Use `subagent_reload` only when resuming a finished/paused worker or when a process restart is required to load changed tools, extensions, or MCP runtime.
+
 ## Sender CLI
 
-Always prefer the companion sender instead of manually writing inbox files:
+External scripts should prefer the companion sender instead of manually writing inbox files:
 
 ```bash
 python3 scripts/notify_agent.py send \
@@ -62,7 +78,7 @@ Input event shape:
 
 The sender resolves the active worker registration and current receiver identity. For a durable watcher handoff, add `--require-lease`; it then waits for and binds to the exact lease. It allocates a monotonic sequence and atomically writes the normalized v2 envelope to `~/.pi/agent/agent-notify/outbox/`. Re-sending the same `eventId` is idempotent (`alreadySent=true`). Expired, unsafe, unowned or ambiguous events fail closed.
 
-Legacy invocation without the `send` word remains accepted:
+The main-agent tool wraps this same fail-closed sender. Legacy invocation without the `send` word remains accepted:
 
 ```bash
 python3 scripts/notify_agent.py "review ready" --item 168373 --to task-...
