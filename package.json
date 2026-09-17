@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-notify",
   "version": "0.2.1",
-  "description": "Script → agent direct notification channel for pi: external scripts write JSON events to a trigger dir, the extension batches/dedups and injects them into the active agent session as user messages. Identity-aware: subagents with PI_SUBAGENT_TASK_ID listen on their own taskId subdirectory for directed wake-ups.",
+  "description": "Script \u2192 agent direct notification channel for pi: external scripts write JSON events to a trigger dir, the extension batches/dedups and injects them into the active agent session as user messages. Identity-aware: subagents with PI_SUBAGENT_TASK_ID listen on their own taskId subdirectory for directed wake-ups.",
   "keywords": [
     "pi-package",
     "notify",
@@ -18,7 +18,7 @@
     "url": "https://github.com/roshameow/pi-agent-notify.git"
   },
   "scripts": {
-    "check": "npx esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --outfile=/tmp/pi-agent-notify-check.mjs && node tests/notification_wait.test.mjs /tmp/pi-agent-notify-check.mjs && node tests/legacy_main_compat.test.mjs /tmp/pi-agent-notify-check.mjs && node tests/notify_subagent_tool.test.mjs /tmp/pi-agent-notify-check.mjs && python3 -m unittest discover -s tests -p 'test_sender.py'"
+    "check": "npx esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --outfile=/tmp/pi-agent-notify-check.mjs && node tests/notification_wait.test.mjs /tmp/pi-agent-notify-check.mjs && node tests/legacy_main_compat.test.mjs /tmp/pi-agent-notify-check.mjs && node tests/notify_subagent_tool.test.mjs /tmp/pi-agent-notify-check.mjs && node tests/dotfile_inbox.test.mjs /tmp/pi-agent-notify-check.mjs && python3 -m unittest discover -s tests -p 'test_sender.py'"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

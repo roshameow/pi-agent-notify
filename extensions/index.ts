@@ -489,7 +489,18 @@ function enqueueEvent(event: NotifyEvent): void {
 
 function collectDirectory(dir: string, outbox = false): void {
 	let names: string[] = [];
-	try { names = fs.readdirSync(dir).filter((name) => name.endsWith(".json")).slice(0, 1000); } catch { return; }
+	try {
+		// Dot-prefixed entries (`.receiver-identity.json`, `.notification-wait-lease`,
+		// `.last-event`, ...) are extension bookkeeping inside the same directory, not
+		// inbound envelopes. They are valid JSON, so collecting them made every live
+		// worker quarantine its OWN identity file on each scan; because that file is
+		// rewritten on every heartbeat the loop never ended and the quarantine directory
+		// grew without bound (observed: 71k entries / 279 MB).
+		names = fs
+			.readdirSync(dir)
+			.filter((name) => name.endsWith(".json") && !name.startsWith("."))
+			.slice(0, 1000);
+	} catch { return; }
 	for (const name of names) {
 		const file = path.join(dir, name);
 		if (outbox) {
