@@ -4,7 +4,7 @@ Fail-closed external event → exact pi session/worker delivery. Watchers publis
 
 ## Properties
 
-- Domain-neutral `itemKey`: examples `mission:hkg_super_v13`, `alpha:KPO237EN`, `ci:run-42`, and legacy six-digit item IDs.
+- Domain-neutral `itemKey`: examples `ci:run-42`, `task:example-42`, `ci:run-42`, and legacy six-digit item IDs.
 - Exact routing: `targetKind + targetId + runId + nonce`; ambiguous same-cwd main sessions are rejected.
 - Busy-worker delivery uses a short-lived `.receiver-identity.json`; durable watcher handoffs additionally require `arm_notification_wait` and a live producer marker.
 - Protocol-v1 inbox events remain readable during migration, while all new senders emit version-2 envelopes.
@@ -16,11 +16,19 @@ Fail-closed external event → exact pi session/worker delivery. Watchers publis
 ## Install
 
 ```bash
-pi install ./pi-agent-notify
+pi install git:github.com/roshameow/pi-agent-notify
 # settings.json may also load extensions/index.ts directly.
 ```
 
-Node 20+ and pi 0.80+ are required.
+Node 20+, Pi with the `@earendil-works` SDK packages, Python 3.9+, and a
+POSIX host (macOS/Linux) are required. The existing live integration uses Pi
+0.87.1; compatibility with every earlier Pi version has not been verified.
+The Python sender uses `fcntl`; native Windows is not supported. Pi supplies the
+Pi peer packages at extension runtime.
+
+Durable worker ownership/waits also require the public
+[pi-subagent-durable](https://github.com/roshameow/pi-subagent-durable) package.
+Main-session notifications do not require a private repository or personal configuration.
 
 ## Main-agent tool
 
@@ -30,7 +38,7 @@ In a main Pi session the extension registers `notify_subagent`. It sends an ordi
 {
   "taskId": "task-mtz...",
   "message": "Re-read the updated skill and continue",
-  "itemKey": "alpha:KPO237EN"
+  "itemKey": "task:example-42"
 }
 ```
 
@@ -44,11 +52,11 @@ External scripts should prefer the companion sender instead of manually writing 
 
 ```bash
 python3 scripts/notify_agent.py send \
-  "QuantNight mission reached terminal item states" \
-  --item mission:hkg_super_v13 \
+  "CI run completed; re-read its authoritative status" \
+  --item ci:run-42 \
   --to task-mtz... \
-  --state quantnight.mission.terminal \
-  --source quantnight-watcher \
+  --state ci.run.completed \
+  --source ci-watcher \
   --level yellow
 ```
 
@@ -65,13 +73,13 @@ Input event shape:
 ```json
 {
   "schemaVersion": 1,
-  "eventId": "quantnight:hkg-v13:terminal:abc123",
-  "producer": "quantnight-watcher",
+  "eventId": "ci:run-42:completed:example",
+  "producer": "ci-watcher",
   "occurredAt": "2026-09-13T12:30:00Z",
   "expiresAt": "2026-09-13T13:30:00Z",
-  "itemKey": "mission:hkg_super_v13",
+  "itemKey": "ci:run-42",
   "target": {"taskId": "task-mtz..."},
-  "eventType": "quantnight.mission.terminal",
+  "eventType": "ci.run.completed",
   "payload": {"terminal": true}
 }
 ```
@@ -89,7 +97,7 @@ python3 scripts/notify_agent.py "review ready" --item 168373 --to task-...
 The delegated task text must declare ownership explicitly:
 
 ```text
-itemKey: mission:hkg_super_v13
+itemKey: ci:run-42
 ```
 
 Then:
@@ -97,7 +105,7 @@ Then:
 1. Start exactly one bounded external watcher.
 2. Persist a repository-local JSON marker containing:
    ```json
-   {"pid": 12345, "itemKey": "mission:hkg_super_v13", "notifyTo": "task-mtz..."}
+   {"pid": 12345, "itemKey": "ci:run-42", "notifyTo": "task-mtz..."}
    ```
 3. Verify the PID is live.
 4. Call `arm_notification_wait` with `itemKey`, precise `wakeCondition`, bounded `leaseSeconds`, `producerPid`, repository-relative `producerMarkerPath`, and optional checkpoint path.
@@ -121,13 +129,13 @@ For a main session, pass an exact `target.sessionId` in the event or provide `cw
   "itemKey": "mission:...",
   "targetKind": "worker",
   "targetId": "task-...",
-  "state": "quantnight.mission.terminal",
+  "state": "ci.run.completed",
   "sequence": 4,
   "occurredAt": "...",
   "expiresAt": "...",
   "nonce": "...",
   "level": "yellow",
-  "source": "quantnight-watcher",
+  "source": "ci-watcher",
   "message": "...",
   "actionable": true,
   "terminal": true
@@ -153,7 +161,16 @@ The extension can ingest old `{level, source, message, itemId, ts}` files from a
 ## Development
 
 ```bash
-npm run check
+npm ci
+npm test
 ```
 
 Tests cover generic item keys, protocol-v1 worker/main ingestion, legacy pending routing, busy-worker receiver identity, stale lease cleanup, ownership/path refusal, exact nonce routing, one-time auto-rearm, replay/expiry rejection, sender idempotence and concurrent sequence allocation.
+
+## Private local material
+
+Keep personal documentation in `docs/private/` or `docs/local/`, and actual
+configuration/state outside the source tree (or the ignored local paths).
+These paths are ignored and the package uses an explicit file allowlist.
+Ignore rules do not remove files already tracked in Git or older commits.
+Generic installation/protocol documentation belongs in the public README.
