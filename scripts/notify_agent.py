@@ -56,8 +56,31 @@ def live_worker(task_id: str, item_key: str) -> dict[str, Any]:
     record = registrations().get(task_id)
     if not record or not alive(record.get("ownerPid", record.get("pid"))):
         raise RuntimeError(f"target worker is not live: {task_id}")
-    heartbeat = datetime.fromisoformat(str(record.get("heartbeatAt", record.get("startedAt"))).replace("Z", "+00:00")).timestamp()
-    if time.time() - heartbeat > 120: raise RuntimeError(f"target worker lease is stale: {task_id}")
+    mode = record.get("ownershipMode")
+    if mode == "receiver":
+        worker_pid = int(record.get("workerPid", 0))
+        expected = INBOX_ROOT / task_id / ".receiver-identity.json"
+        if (record.get("taskId") != task_id or int(record.get("ownerPid", 0)) != worker_pid
+                or not alive(worker_pid) or not record.get("cwd")
+                or not SAFE_ID.fullmatch(str(record.get("parentSessionId", "")))
+                or Path(str(record.get("receiverIdentityPath", ""))).resolve() != expected.resolve()
+                or expected.is_symlink()):
+            raise RuntimeError("receiver-owned worker registration mismatch")
+        identity = worker_receiver_identity(task_id, item_key)
+        if (identity.get("targetKind") != "worker" or identity.get("targetId") != task_id
+                or not SAFE_ID.fullmatch(str(identity.get("runId", "")))
+                or not isinstance(identity.get("nonce"), str) or not 16 <= len(identity["nonce"]) <= 200
+                or int(identity.get("pid", 0)) != worker_pid or not identity.get("cwd")
+                or Path(identity["cwd"]).resolve() != Path(record["cwd"]).resolve()
+                or {str(x) for x in identity.get("itemKeys", [])} != record_keys(record)):
+            raise RuntimeError("receiver-owned worker identity/cwd/items mismatch")
+        record["_receiverIdentity"] = identity
+    else:
+        if mode not in (None, "", "parent"):
+            raise RuntimeError("unsupported worker ownership mode")
+        heartbeat = datetime.fromisoformat(str(record.get("heartbeatAt", record.get("startedAt"))).replace("Z", "+00:00")).timestamp()
+        if heartbeat > time.time() + 300 or time.time() - heartbeat > 120:
+            raise RuntimeError(f"target worker lease is stale: {task_id}")
     if item_key not in record_keys(record): raise RuntimeError(f"worker {task_id} does not own {item_key}")
     return record
 
@@ -86,7 +109,7 @@ def worker_receiver_identity(task_id: str, item_key: str) -> dict[str, Any]:
     if not alive(identity.get("pid")):
         raise RuntimeError("worker receiver process is not live")
     heartbeat = datetime.fromisoformat(str(identity.get("heartbeatAt", "")).replace("Z", "+00:00")).timestamp()
-    if time.time() - heartbeat > 90:
+    if heartbeat > time.time() + 300 or time.time() - heartbeat > 90:
         raise RuntimeError("worker receiver identity is stale")
     if item_key not in {str(x) for x in identity.get("itemKeys", [])}:
         raise RuntimeError(f"worker receiver does not own {item_key}")
@@ -113,16 +136,36 @@ def resolve_main(cwd: str, session_id: str | None) -> dict[str, Any]:
             if not alive(row.get("pid")): continue
             try:
                 heartbeat = datetime.fromisoformat(str(row.get("heartbeatAt", "")).replace("Z", "+00:00")).timestamp()
-                if time.time() - heartbeat > 90: continue
+                if heartbeat > time.time() + 300 or time.time() - heartbeat > 90: continue
             except ValueError:
                 continue
             if session_id and row.get("sessionId") != session_id: continue
             if not session_id and Path(str(row.get("cwd", ""))).resolve() != Path(cwd).resolve(): continue
             candidates.append(row)
         except Exception: continue
-    if len(candidates) != 1:
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates or not session_id:
         raise RuntimeError(f"main-session routing must resolve exactly one live session, found {len(candidates)}")
-    return candidates[0]
+    # Offline routing is exact-ID only. Never guess a historical session by cwd.
+    session_id = validate_key(session_id, "sessionId", SAFE_ID)
+    saved = read_json(STATE_ROOT / "main-identities" / f"{hashlib.sha256(session_id.encode()).hexdigest()[:24]}.json")
+    file = Path(str(saved.get("sessionFile", "")))
+    if (saved.get("version") != 2 or saved.get("targetKind") != "main"
+            or saved.get("sessionId") != session_id or saved.get("targetId") != session_id
+            or not file.is_absolute() or "subagent-task" in file.name or file.resolve() != file
+            or not saved.get("cwd") or not SAFE_ID.fullmatch(str(saved.get("runId", "")))
+            or not isinstance(saved.get("nonce"), str) or len(saved["nonce"]) < 16):
+        raise RuntimeError("invalid persistent main-session identity")
+    with file.open() as fh:
+        header = json.loads(fh.readline())
+    if (header.get("type") != "session" or header.get("id") != session_id
+            or Path(str(header.get("cwd", ""))).resolve() != Path(saved["cwd"]).resolve()):
+        raise RuntimeError("offline target is not the exact canonical session")
+    until = datetime.fromisoformat(str(saved.get("offlineUntil", "")).replace("Z", "+00:00")).timestamp()
+    if until <= time.time() or until > time.time() + 86400 + 300:
+        raise RuntimeError("offline main-session recovery window expired/invalid")
+    return {**saved, "_offline": True, "_offlineUntil": until}
 
 
 def atomic_write(path: Path, value: dict[str, Any]) -> None:
@@ -207,14 +250,24 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
     task_id = value["taskId"]
     if task_id:
         task_id = validate_key(task_id, "taskId", SAFE_ID)
-        live_worker(task_id, item_key)
+        registration = live_worker(task_id, item_key)
         identity = resolve_worker_identity(task_id, item_key, args.require_lease, args.lease_wait_seconds)
+        if registration.get("ownershipMode") == "receiver":
+            receiver = registration["_receiverIdentity"]
+            if (identity.get("runId") != receiver.get("runId") or identity.get("nonce") != receiver.get("nonce")
+                    or Path(str(identity.get("cwd", ""))).resolve() != Path(registration["cwd"]).resolve()
+                    or int(identity.get("pid", 0)) != int(registration["workerPid"])):
+                raise RuntimeError("wait/receiver identity does not match receiver-owned worker")
         target_kind, target_id = "worker", task_id
         run_id, nonce = identity["runId"], identity["nonce"]
     else:
         raw = value["raw"]
         cwd = raw.get("cwd") or args.cwd or os.getcwd()
         main = resolve_main(cwd, value["sessionId"])
+        if main.get("_offline"):
+            expiry = datetime.fromisoformat(value["expiresAt"]).timestamp()
+            if expiry > min(time.time() + 3600, main["_offlineUntil"]) + 1:
+                raise RuntimeError("offline notification TTL exceeds one hour/recovery window")
         target_kind, target_id = "main", main["sessionId"]
         run_id, nonce = main["runId"], main["nonce"]
     stream = f"{target_kind}|{target_id}|{item_key}|{run_id}|{value['source']}"

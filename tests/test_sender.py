@@ -52,6 +52,60 @@ class SenderTests(unittest.TestCase):
         event = self.event("evt-main"); event["target"] = {}; event["cwd"] = str(self.root)
         self.assertNotEqual(self.send(event, check=False).returncode, 0)
 
+    def receiver_owned(self):
+        identity = {"version": 2, "targetKind": "worker", "targetId": self.task, "taskId": self.task,
+                    "pid": os.getpid(), "cwd": str(self.root), "itemKeys": [self.item],
+                    "runId": "run-test", "nonce": "0123456789abcdef", "heartbeatAt": datetime.now(timezone.utc).isoformat()}
+        identity_path = self.inbox / self.task / ".receiver-identity.json"
+        identity_path.write_text(json.dumps(identity))
+        record = {"ownershipMode": "receiver", "taskId": self.task, "ownerPid": os.getpid(),
+                  "workerPid": os.getpid(), "parentSessionId": "parent-exited", "cwd": str(self.root),
+                  "receiverIdentityPath": str(identity_path), "itemKeys": [self.item], "heartbeatAt": "2000-01-01T00:00:00Z"}
+        (self.inbox / ".active-workers.json").write_text(json.dumps({"workers": {self.task: record}}))
+        lease_path = self.inbox / self.task / ".notification-wait-lease"
+        lease = json.loads(lease_path.read_text()); lease.update(pid=os.getpid(), cwd=str(self.root))
+        lease_path.write_text(json.dumps(lease))
+        return record, identity, identity_path
+
+    def test_receiver_owner_does_not_depend_on_parent_heartbeat(self):
+        self.receiver_owned()
+        self.assertEqual(self.send(self.event("evt-receiver-owned")).returncode, 0)
+
+    def test_receiver_owner_mismatches_fail_closed(self):
+        for field, value in [("pid", 1), ("cwd", str(self.root / "wrong")), ("itemKeys", [self.item, "ci:extra"]),
+                             ("heartbeatAt", "2000-01-01T00:00:00Z"), ("taskId", "wrong-task")]:
+            record, identity, file = self.receiver_owned()
+            identity[field] = value; file.write_text(json.dumps(identity))
+            with self.subTest(field=field):
+                self.assertNotEqual(self.send(self.event(f"evt-mismatch-{field}"), check=False).returncode, 0)
+        record, identity, file = self.receiver_owned(); record["workerPid"] = 1
+        (self.inbox / ".active-workers.json").write_text(json.dumps({"workers": {self.task: record}}))
+        self.assertNotEqual(self.send(self.event("evt-registry-pid"), check=False).returncode, 0)
+
+    def test_unknown_mode_does_not_fall_back_to_parent(self):
+        record, identity, file = self.receiver_owned(); record["ownershipMode"] = "unknown"
+        (self.inbox / ".active-workers.json").write_text(json.dumps({"workers": {self.task: record}}))
+        self.assertNotEqual(self.send(self.event("evt-unknown-mode"), check=False).returncode, 0)
+
+    def test_offline_exact_session_identity_and_ttl(self):
+        import hashlib
+        session = "offline-main"
+        file = (self.root / "canonical.jsonl").resolve()
+        file.write_text(json.dumps({"type": "session", "id": session, "cwd": str(self.root)}) + "\n")
+        directory = self.state / "main-identities"; directory.mkdir(parents=True)
+        identity_path = directory / f"{hashlib.sha256(session.encode()).hexdigest()[:24]}.json"
+        row = {"version": 2, "targetKind": "main", "sessionId": session, "targetId": session,
+               "sessionFile": str(file), "cwd": str(self.root), "runId": "run-offline", "nonce": "0123456789abcdef",
+               "offlineUntil": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}
+        identity_path.write_text(json.dumps(row))
+        event = self.event("evt-offline"); event["target"] = {"sessionId": session}
+        self.assertEqual(json.loads(self.send(event).stdout)["event"]["runId"], "run-offline")
+        event["eventId"] = "evt-offline-ttl"; event["expiresAt"] = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        self.assertNotEqual(self.send(event, check=False).returncode, 0)
+        event["expiresAt"] = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        row["offlineUntil"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(); identity_path.write_text(json.dumps(row))
+        self.assertNotEqual(self.send(event, check=False).returncode, 0)
+
     def test_concurrent_sequences_are_unique(self):
         processes = []
         for i in range(8):

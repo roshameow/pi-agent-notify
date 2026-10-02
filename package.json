@@ -18,7 +18,7 @@
     "url": "https://github.com/roshameow/pi-agent-notify.git"
   },
   "scripts": {
-    "check": "esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --outfile=.test-build/index.mjs && node tests/notification_wait.test.mjs .test-build/index.mjs && node tests/legacy_main_compat.test.mjs .test-build/index.mjs && node tests/notify_subagent_tool.test.mjs .test-build/index.mjs && node tests/dotfile_inbox.test.mjs .test-build/index.mjs && python3 -m unittest discover -s tests -p 'test_sender.py'",
+    "check": "esbuild extensions/index.ts --bundle --platform=node --format=esm --external:@earendil-works/* --outfile=.test-build/index.mjs && node tests/notification_wait.test.mjs .test-build/index.mjs && node tests/legacy_main_compat.test.mjs .test-build/index.mjs && node tests/notify_subagent_tool.test.mjs .test-build/index.mjs && node tests/dotfile_inbox.test.mjs .test-build/index.mjs && node tests/main_restart.test.mjs .test-build/index.mjs && python3 -m unittest discover -s tests -p 'test_sender.py'",
     "test": "npm run check"
   },
   "peerDependencies": {
@@ -39,7 +39,10 @@
     "extensions/index.ts",
     "scripts/notify_agent.py",
     "README.md",
-    "LICENSE"
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "scripts/session_controller.py"
   ],
   "devDependencies": {
     "esbuild": "^0.25.0"

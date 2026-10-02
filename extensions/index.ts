@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const INBOX_ROOT = path.resolve(process.env.PI_AGENT_NOTIFY_DIR || "/tmp/pi-agent-notify");
@@ -13,6 +14,8 @@ const EVENT_LOG = process.env.PI_AGENT_NOTIFY_LOG || path.join(STATE_ROOT, "even
 const MAIN_REGISTRY_DIR = path.join(INBOX_ROOT, ".main-sessions");
 const MAIN_PENDING_DIR = path.join(INBOX_ROOT, "main-pending");
 const WORKER_REGISTRY = path.join(INBOX_ROOT, ".active-workers.json");
+const MAIN_IDENTITY_DIR = path.join(STATE_ROOT, "main-identities");
+const OFFLINE_IDENTITY_MS = 24 * 60 * 60 * 1000;
 const WAIT_LEASE_FILE = ".notification-wait-lease";
 const RECEIVER_IDENTITY_FILE = ".receiver-identity.json";
 const SUBAGENT_TASK_ID = process.env.PI_SUBAGENT_TASK_ID || "";
@@ -34,6 +37,8 @@ const SAFE_TARGET_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const SENDER_SCRIPT = path.resolve(
 	process.env.PI_AGENT_NOTIFY_SENDER || path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/notify_agent.py"),
 );
+
+const CONTROLLER_SCRIPT = process.env.PI_AGENT_NOTIFY_CONTROLLER || path.join(path.dirname(SENDER_SCRIPT), "session_controller.py");
 
 interface NotifyEvent {
 	version: 2;
@@ -84,6 +89,13 @@ interface DedupState {
 }
 
 let currentCtx: any = null;
+let receiverEnabled = false;
+let controller: ChildProcess | null = null;
+let controllerToken = "";
+let mainSessionFile = "";
+let inflight = new Map<string, { event: NotifyEvent; processId: string }>();
+const processIdentityKey = "__pi_agent_notify_process_identity__";
+const processIdentity = ((globalThis as any)[processIdentityKey] ||= randomUUID());
 let currentSessionId = "";
 let currentRunId = "";
 let currentNonce = "";
@@ -186,8 +198,28 @@ function readWorkerRegistration(taskId: string): any | null {
 		const registry = JSON.parse(fs.readFileSync(WORKER_REGISTRY, "utf8"));
 		const record = registry?.workers?.[taskId];
 		if (!record || !pidAlive(record.ownerPid ?? record.pid)) return null;
+		if (record.ownershipMode === "receiver") {
+			const workerPid = Number(record.workerPid);
+			const expected = path.join(INBOX_ROOT, taskId, RECEIVER_IDENTITY_FILE);
+			if (record.taskId !== taskId || Number(record.ownerPid) !== workerPid || !pidAlive(workerPid)
+				|| typeof record.cwd !== "string" || !record.cwd || !isSafeTargetId(record.parentSessionId) || path.resolve(record.cwd || "") !== path.resolve(currentCtx?.cwd || "")
+				|| path.resolve(record.receiverIdentityPath || "") !== expected || !fs.lstatSync(expected).isFile()) return null;
+			const identity = JSON.parse(fs.readFileSync(expected, "utf8"));
+			const heartbeat = parseTime(identity.heartbeatAt);
+			const keys = registrationKeys(record).sort();
+			const receiverKeys = [...new Set((Array.isArray(identity.itemKeys) ? identity.itemKeys : []).map(String))].sort();
+			if (identity.version !== 2 || identity.taskId !== taskId || identity.targetId !== taskId
+				|| identity.targetKind !== "worker" || Number(identity.pid) !== workerPid
+				|| !isSafeTargetId(identity.runId) || typeof identity.nonce !== "string" || identity.nonce.length < 16 || identity.nonce.length > 200
+				|| typeof identity.cwd !== "string" || !identity.cwd || path.resolve(identity.cwd) !== path.resolve(record.cwd)
+				|| !Number.isFinite(heartbeat) || heartbeat > Date.now() + FUTURE_SKEW_MS || Date.now() - heartbeat > LIVE_HEARTBEAT_MS
+				|| JSON.stringify(keys) !== JSON.stringify(receiverKeys)) return null;
+			return record;
+		}
+		// Never treat an unknown ownership mode as a weaker legacy registration.
+		if (record.ownershipMode && record.ownershipMode !== "parent") return null;
 		const heartbeat = parseTime(record.heartbeatAt || record.startedAt);
-		if (Number.isFinite(heartbeat) && Date.now() - heartbeat > 120000) return null;
+		if (!Number.isFinite(heartbeat) || heartbeat > Date.now() + FUTURE_SKEW_MS || Date.now() - heartbeat > 120000) return null;
 		return record;
 	} catch { return null; }
 }
@@ -281,6 +313,210 @@ function mainIdentity(sessionId: string): { runId: string; nonce: string } {
 	return identity;
 }
 
+function mainIdentityPath(): string {
+	return path.join(MAIN_IDENTITY_DIR, `${hash(currentSessionId).slice(0, 24)}.json`);
+}
+
+function canonicalSessionFile(ctx: any): string {
+	const file = ctx.sessionManager?.getSessionFile?.();
+	if (!file) return ""; // Ephemeral sessions have no offline recovery identity.
+	const resolved = path.resolve(file);
+	if (path.basename(resolved).includes("subagent-task")) throw new Error("notification controller requires a canonical session, not a task mirror");
+	try { return fs.realpathSync(resolved); }
+	catch (error: any) {
+		if (error.code !== "ENOENT") throw error;
+		return path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved));
+	}
+}
+
+async function acquireMainController(sessionId: string): Promise<void> {
+	ensurePrivateDir(MAIN_IDENTITY_DIR);
+	const lock = path.join(MAIN_IDENTITY_DIR, `${hash(sessionId).slice(0, 24)}.json.controller`);
+	const token = randomUUID();
+	const child = spawn("python3", [CONTROLLER_SCRIPT, lock, String(process.pid), token], { stdio: ["pipe", "pipe", "pipe"] });
+	await new Promise<void>((resolve, reject) => {
+		let output = "", errorOutput = "", settled = false;
+		const fail = (error: Error) => {
+			if (settled) return;
+			settled = true; clearTimeout(timer); child.stdin?.end(); child.kill(); reject(error);
+		};
+		const timer = setTimeout(() => fail(new Error("main controller lock acquisition timed out")), 5000);
+		child.on("error", fail);
+		child.stderr?.on("data", (chunk) => { errorOutput += String(chunk); });
+		child.on("exit", () => {
+			if (!settled) fail(new Error(errorOutput.trim() || "main controller guardian exited"));
+			if (controllerToken === token) {
+				receiverEnabled = false;
+				log("main controller lost; receiver disabled");
+			}
+		});
+		child.stdout?.on("data", (chunk) => {
+			output += String(chunk);
+			if (!output.includes("\n") || settled) return;
+			try {
+				const reply = JSON.parse(output.split("\n")[0]);
+				if (reply.ready !== true || reply.token !== token) throw new Error("invalid controller handshake");
+				controller = child; controllerToken = token;
+				settled = true; clearTimeout(timer); resolve();
+			} catch (error) { fail(error as Error); }
+		});
+	});
+	// First migration also excludes an old live Pi which has not loaded the
+	// flock controller yet. A stale heartbeat is NOT permission to double-open
+	// its exact session while its PID is still alive.
+	try {
+		const legacyFile = path.join(MAIN_REGISTRY_DIR, `${sessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160)}.json`);
+		let registration: any;
+		try { registration = JSON.parse(fs.readFileSync(legacyFile, "utf8")); }
+		catch (error: any) { if (error.code !== "ENOENT") throw error; }
+		if (registration?.sessionId === sessionId && Number(registration.pid) !== process.pid && pidAlive(registration.pid)) {
+			throw new Error("main session already has an active controller (legacy registration)");
+		}
+	} catch (error) { await releaseMainController(); throw error; }
+}
+
+async function releaseMainController(): Promise<void> {
+	const child = controller;
+	controller = null; controllerToken = "";
+	if (!child || child.exitCode !== null) return;
+	await new Promise<void>((resolve) => {
+		const timer = setTimeout(() => { child.kill("SIGTERM"); resolve(); }, 2000);
+		child.once("exit", () => { clearTimeout(timer); resolve(); });
+		child.stdin?.end();
+	});
+}
+
+function restoreMainIdentity(ctx: any): { runId: string; nonce: string } {
+	if (mainSessionFile && fs.existsSync(mainSessionFile)) {
+		const header = JSON.parse(fs.readFileSync(mainSessionFile, "utf8").split("\n")[0]);
+		if (header.type !== "session" || header.id !== currentSessionId || path.resolve(header.cwd || "") !== path.resolve(ctx.cwd)) {
+			throw new Error("canonical main session header mismatch");
+		}
+	}
+	const globalMap = (globalThis as any).__pi_agent_notify_main_identities__ as Map<string, any> | undefined;
+	const existing = globalMap?.get(currentSessionId);
+	let saved: any;
+	try { saved = JSON.parse(fs.readFileSync(mainIdentityPath(), "utf8")); }
+	catch (error: any) { if (error.code !== "ENOENT") throw error; }
+	if (saved) {
+		if (saved.version !== 2 || saved.targetKind !== "main" || saved.sessionId !== currentSessionId || saved.targetId !== currentSessionId
+			|| !mainSessionFile || saved.sessionFile !== mainSessionFile || saved.cwd !== path.resolve(ctx.cwd)
+			|| !isSafeTargetId(saved.runId) || typeof saved.nonce !== "string" || saved.nonce.length < 16 || saved.nonce.length > 200) {
+			throw new Error("persistent main identity does not match exact session/cwd");
+		}
+		if (existing && (existing.runId !== saved.runId || existing.nonce !== saved.nonce)) {
+			throw new Error("live main identity conflicts with persisted identity");
+		}
+		(globalThis as any).__pi_agent_notify_main_identities__ ||= new Map();
+		(globalThis as any).__pi_agent_notify_main_identities__.set(currentSessionId, { runId: saved.runId, nonce: saved.nonce });
+		return { runId: saved.runId, nonce: saved.nonce };
+	}
+	// First /reload migration MUST keep the already-live global identity.
+	return existing || mainIdentity(currentSessionId);
+}
+
+function persistMainIdentity(ctx: any): void {
+	if (!mainSessionFile || !controllerToken) return;
+	atomicWriteJson(mainIdentityPath(), {
+		version: 2, targetKind: "main", targetId: currentSessionId, sessionId: currentSessionId,
+		sessionFile: mainSessionFile, cwd: path.resolve(ctx.cwd), runId: currentRunId, nonce: currentNonce,
+		updatedAt: new Date().toISOString(), offlineUntil: new Date(Date.now() + OFFLINE_IDENTITY_MS).toISOString(),
+	});
+}
+
+function inflightPath(): string {
+	return path.join(STATE_ROOT, "inflight", `${hash(`${SUBAGENT_TASK_ID ? "worker" : "main"}:${SUBAGENT_TASK_ID || currentSessionId}`).slice(0, 24)}.json`);
+}
+
+function receiptMarker(event: NotifyEvent): string {
+	return `[[agent-notify:${event.eventId}:${hash(`${event.runId}|${event.nonce}|${event.eventId}`).slice(0, 24)}]]`;
+}
+
+let persistedReceiptText = "";
+let persistedPassiveReceipts = new Set<string>();
+let receiptSnapshotKey = "";
+
+function saveInflight(): void {
+	const records = [...inflight.values(), ...pendingEvents.map((event) => ({ event, processId: "" }))];
+	atomicWriteJson(inflightPath(), { version: 1, records });
+}
+
+function readPersistedReceipts(): void {
+	const file = currentCtx?.sessionManager?.getSessionFile?.();
+	if (!file) { persistedReceiptText = ""; persistedPassiveReceipts.clear(); receiptSnapshotKey = ""; return; }
+	try {
+		const stat = fs.statSync(file);
+		const snapshotKey = `${path.resolve(file)}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+		if (snapshotKey === receiptSnapshotKey) return;
+		persistedReceiptText = "";
+		persistedPassiveReceipts.clear();
+		const lines = fs.readFileSync(file, "utf8").split("\n");
+		const header = JSON.parse(lines[0]);
+		if (header.type !== "session" || header.id !== currentSessionId || path.resolve(header.cwd || "") !== path.resolve(currentCtx.cwd)) return;
+		for (const line of lines.slice(1)) {
+			if (!line) continue;
+			let entry: any;
+			try { entry = JSON.parse(line); } catch { continue; }
+			if (entry.type === "message" && entry.message?.role === "user") {
+				const content = entry.message.content;
+				const text = typeof content === "string" ? content : (Array.isArray(content) ? content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n") : "");
+				if (text.startsWith("[agent-notify]\n")) persistedReceiptText += text + "\n";
+			} else if (entry.type === "custom" && entry.customType === "agent-notify" && entry.data?.receiptMarker) {
+				persistedPassiveReceipts.add(String(entry.data.receiptMarker));
+			}
+		}
+		// Receipt bytes must survive a process/machine crash, not merely exist in
+		// SessionManager's unflushed first-turn buffer or the kernel page cache.
+		const fd = fs.openSync(file, "r");
+		try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+		fsyncDir(path.dirname(file));
+		// Cache the pre-read stat: an append during this read forces another scan.
+		receiptSnapshotKey = snapshotKey;
+	} catch { persistedReceiptText = ""; persistedPassiveReceipts.clear(); receiptSnapshotKey = ""; }
+}
+
+function hasPersistedReceipt(event: NotifyEvent): boolean {
+	const marker = receiptMarker(event);
+	return persistedReceiptText.includes(marker) || persistedPassiveReceipts.has(marker);
+}
+
+function reconcileReceipts(): void {
+	if (inflight.size === 0) return;
+	readPersistedReceipts();
+	let changed = false;
+	for (const [id, record] of inflight) {
+		if (hasPersistedReceipt(record.event) && markDelivered(record.event)) { inflight.delete(id); changed = true; }
+	}
+	if (changed) {
+		try { saveInflight(); } catch (error) { log(`receipt journal save failed: ${error}`); }
+	}
+}
+
+function loadInflight(): void {
+	let records: any[] = [];
+	try {
+		const journal = JSON.parse(fs.readFileSync(inflightPath(), "utf8"));
+		if (journal.version !== 1 || !Array.isArray(journal.records)) throw new Error("invalid inflight journal");
+		records = journal.records;
+	} catch (error: any) {
+		if (error.code !== "ENOENT") throw error; // Fail closed rather than overwrite recovery state.
+	}
+	if (records.length) readPersistedReceipts();
+	for (const record of records) {
+		const outbox = record.event?._outboxPath;
+		if (outbox && path.dirname(path.resolve(outbox)) !== OUTBOX_DIR) throw new Error("unsafe journal outbox path");
+		const event = normalizeEvent(record.event, JSON.stringify(record.event), outbox);
+		if (!event || eventMatchesReceiver(event)) { log("ignored stale inflight identity"); continue; }
+		if (hasPersistedReceipt(event)) {
+			if (!markDelivered(event)) inflight.set(event.eventId, { event, processId: processIdentity });
+			continue;
+		}
+		if (record.processId === processIdentity) inflight.set(event.eventId, { event, processId: processIdentity });
+		else { pendingEventIds.add(event.eventId); pendingEvents.push(event); }
+	}
+	followUpOutstanding = inflight.size > 0;
+}
+
 function cleanupMainRegistrations(): void {
 	let names: string[] = [];
 	try { names = fs.readdirSync(MAIN_REGISTRY_DIR); } catch { return; }
@@ -296,9 +532,10 @@ function cleanupMainRegistrations(): void {
 }
 
 function writeSessionRegistration(ctx: any): void {
-	if (SUBAGENT_TASK_ID || !sessionRegistryFile) return;
+	if (SUBAGENT_TASK_ID || !sessionRegistryFile || !receiverEnabled) return;
 	try {
 		cleanupMainRegistrations();
+		persistMainIdentity(ctx);
 		atomicWriteJson(sessionRegistryFile, {
 			version: 2,
 			targetKind: "main",
@@ -308,7 +545,7 @@ function writeSessionRegistration(ctx: any): void {
 			nonce: currentNonce,
 			pid: process.pid,
 			cwd: path.resolve(ctx.cwd),
-			sessionFile: ctx.sessionManager?.getSessionFile?.() || null,
+			sessionFile: mainSessionFile || null,
 			inbox: inboxDir,
 			heartbeatAt: new Date().toISOString(),
 			heartbeat: Date.now(), // protocol-v1 sender compatibility
@@ -365,9 +602,9 @@ function pruneDedup(): void {
 	}
 }
 
-function saveDedup(): void {
+function saveDedup(): boolean {
 	pruneDedup();
-	try { atomicWriteJson(dedupPath(), dedupState); } catch (error) { log(`dedup save failed: ${error}`); }
+	try { atomicWriteJson(dedupPath(), dedupState); return true; } catch (error) { log(`dedup save failed: ${error}`); return false; }
 }
 
 function semanticKey(event: NotifyEvent): string {
@@ -394,16 +631,19 @@ function staleReason(event: NotifyEvent, now = Date.now()): string | null {
 	return null;
 }
 
-function markDelivered(event: NotifyEvent): void {
+function markDelivered(event: NotifyEvent): boolean {
+	const previous = dedupState;
+	dedupState = { version: 1, seen: { ...previous.seen }, semantic: { ...previous.semantic }, streams: { ...previous.streams } };
 	const now = Date.now();
 	dedupState.seen[event.eventId] = now;
 	dedupState.semantic[semanticKey(event)] = now;
 	dedupState.streams[streamKey(event)] = { sequence: event.sequence, occurredAt: parseTime(event.occurredAt) };
-	saveDedup();
+	if (!saveDedup()) { dedupState = previous; return false; }
 	if (event._outboxPath) {
 		try { fs.rmSync(event._outboxPath, { force: true }); } catch {}
 	}
-	log("delivered", event);
+	log("delivered (session persisted ACK)", event);
+	return true;
 }
 
 function discardEvent(event: NotifyEvent, reason: string): void {
@@ -482,7 +722,8 @@ function eventMatchesReceiver(event: NotifyEvent): string | null {
 }
 
 function enqueueEvent(event: NotifyEvent): void {
-	if (pendingEventIds.has(event.eventId)) return;
+	if (hasPersistedReceipt(event)) { markDelivered(event); return; }
+	if (pendingEventIds.has(event.eventId) || inflight.has(event.eventId)) return;
 	pendingEventIds.add(event.eventId);
 	pendingEvents.push(event);
 }
@@ -528,12 +769,15 @@ function collectDirectory(dir: string, outbox = false): void {
 			const mismatch = eventMatchesReceiver(event);
 			if (mismatch) { quarantine(processing, mismatch); continue; }
 			enqueueEvent(event);
+			try { saveInflight(); } catch (error) { fs.renameSync(processing, file); log(`inbox journal failed; retained: ${error}`); continue; }
 			fs.rmSync(processing, { force: true });
 		} catch (error) { quarantine(processing, `inbox collection failed: ${error}`); }
 	}
 }
 
 function collectFiles(): void {
+	if (!receiverEnabled) return;
+	reconcileReceipts();
 	collectDirectory(inboxDir, false);
 	if (!SUBAGENT_TASK_ID && pendingScopeDir) collectDirectory(pendingScopeDir, false);
 	collectDirectory(OUTBOX_DIR, true);
@@ -567,16 +811,20 @@ async function scheduleFlush(): Promise<void> {
 
 function formatEvent(event: NotifyEvent): string {
 	const icon = event.level === "red" ? "🔴" : event.level === "green" ? "🟢" : "🟡";
-	return `${icon}[${event.source}] [${event.itemKey}] [${event.state}#${event.sequence}] ${event.message}`;
+	return `${receiptMarker(event)} ${icon}[${event.source}] [${event.itemKey}] [${event.state}#${event.sequence}] ${event.message}`;
 }
 
 function passiveGreen(event: NotifyEvent): boolean {
 	try {
-		piApi?.appendEntry?.("agent-notify", { ...event, _outboxPath: undefined, receivedAt: new Date().toISOString() });
+		inflight.set(event.eventId, { event, processId: processIdentity });
+		saveInflight();
+		if (!piApi?.appendEntry) throw new Error("session appendEntry unavailable");
+		piApi.appendEntry("agent-notify", { ...event, _outboxPath: undefined, receiptMarker: receiptMarker(event), receivedAt: new Date().toISOString() });
 		if (currentCtx?.hasUI) currentCtx.ui.setStatus("agent-notify", `🟢 ${event.itemKey}: ${event.state}`);
-		markDelivered(event);
+		reconcileReceipts();
 		return true;
 	} catch (error) {
+		inflight.delete(event.eventId);
 		log(`passive green update failed: ${error}`, event);
 		return false;
 	}
@@ -585,12 +833,14 @@ function passiveGreen(event: NotifyEvent): boolean {
 let piApi: ExtensionAPI | null = null;
 
 async function flushBatch(): Promise<void> {
-	if (pendingEvents.length === 0 || !piApi) return;
+	if (!receiverEnabled || pendingEvents.length === 0 || !piApi) return;
 	const batch = pendingEvents;
 	pendingEvents = [];
 	for (const event of batch) pendingEventIds.delete(event.eventId);
 	const actionable: NotifyEvent[] = [];
 	for (const event of batch) {
+		const mismatch = eventMatchesReceiver(event);
+		if (mismatch) { if (event._outboxPath) quarantine(event._outboxPath, mismatch); else log(`rejected pending event: ${mismatch}`, event); continue; }
 		const stale = staleReason(event);
 		if (stale) { discardEvent(event, stale); continue; }
 		const lease = SUBAGENT_TASK_ID ? readWaitLease(false) : null;
@@ -609,18 +859,24 @@ async function flushBatch(): Promise<void> {
 		log(`followUp outstanding; retained ${actionable.length} event(s)`);
 		return;
 	}
-	const body = `[agent-notify]\n${actionable.map(formatEvent).join("\n")}\n\nExternal directed events were validated. Re-read the authoritative state/checkpoint before acting; do not assume the notification itself proves completion.`;
+	const body = `[agent-notify]\n${actionable.map(formatEvent).join("\n")}\n\nExternal directed events were validated. Re-read the authoritative state/checkpoint before acting; do not assume the notification itself proves completion. Delivery is at-least-once: make external effects idempotent by business/event identity.`;
 	try {
+		// Persist before calling the void host API. A new process replays this
+		// journal; same-process /reload preserves already queued work.
+		for (const event of actionable) inflight.set(event.eventId, { event, processId: processIdentity });
+		saveInflight();
 		if (currentCtx?.isIdle?.()) piApi.sendUserMessage(body);
 		else {
 			piApi.sendUserMessage(body, { deliverAs: "followUp" });
 			followUpOutstanding = true;
 		}
-		for (const event of actionable) markDelivered(event);
+		// Releasing an agent_end hold permits the queued user message to run.
+		// This is NOT a delivery ACK: outbox/journal remain until session persistence.
 		if (SUBAGENT_TASK_ID) clearWaitLease("matching_directed_event_delivered");
 		if (actionable.some((event) => event.level === "red") && currentCtx?.hasUI) currentCtx.ui.notify("🔴 External event needs attention", "error");
 	} catch (error) {
-		for (const event of actionable) enqueueEvent(event);
+		for (const event of actionable) { inflight.delete(event.eventId); enqueueEvent(event); }
+		try { saveInflight(); } catch {}
 		log(`injection failed; retained ${actionable.length}: ${error}`);
 	}
 }
@@ -785,6 +1041,8 @@ export default function activate(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
+		receiverEnabled = false;
+		inflight = new Map();
 		if (SUBAGENT_TASK_ID) {
 			currentSessionId = String(ctx.sessionManager?.getSessionId?.() || SUBAGENT_TASK_ID);
 			const identity = mainIdentity(`worker:${SUBAGENT_TASK_ID}:${currentSessionId}`);
@@ -798,16 +1056,30 @@ export default function activate(pi: ExtensionAPI) {
 			}
 		} else {
 			currentSessionId = String(ctx.sessionManager?.getSessionId?.() || process.pid);
-			const identity = mainIdentity(currentSessionId);
+			try { await acquireMainController(currentSessionId); }
+			catch (error) {
+				// Lifecycle exceptions are otherwise only reported by Pi, leaving a
+				// second transcript writer alive despite receiver exclusion.
+				if (ctx.hasUI) ctx.ui.notify(`Main session controller refused: ${String(error)}`, "error");
+				ctx.shutdown?.();
+				throw error;
+			}
+			let identity: { runId: string; nonce: string };
+			try { mainSessionFile = canonicalSessionFile(ctx); identity = restoreMainIdentity(ctx); }
+			catch (error) { await releaseMainController(); throw error; }
+			receiverEnabled = true;
 			currentRunId = identity.runId;
 			currentNonce = identity.nonce;
 			inboxDir = path.join(INBOX_ROOT, "main", currentSessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160));
 			pendingScopeDir = path.join(MAIN_PENDING_DIR, scopeKey(ctx.cwd));
 			sessionRegistryFile = path.join(MAIN_REGISTRY_DIR, `${currentSessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160)}.json`);
+			try { persistMainIdentity(ctx); }
+			catch (error) { receiverEnabled = false; await releaseMainController(); throw error; }
 			writeSessionRegistration(ctx);
 			heartbeatTimer = setInterval(() => writeSessionRegistration(ctx), MAIN_HEARTBEAT_MS);
 			heartbeatTimer.unref?.();
 		}
+		receiverEnabled = true;
 		for (const dir of [inboxDir, OUTBOX_DIR, QUARANTINE_DIR, ...(!SUBAGENT_TASK_ID && pendingScopeDir ? [pendingScopeDir] : [])]) ensurePrivateDir(dir);
 		if (SUBAGENT_TASK_ID) {
 			writeWorkerReceiverIdentity(ctx);
@@ -815,6 +1087,8 @@ export default function activate(pi: ExtensionAPI) {
 			heartbeatTimer.unref?.();
 		}
 		loadDedup();
+		try { loadInflight(); }
+		catch (error) { receiverEnabled = false; removeSessionRegistration(); removeWorkerReceiverIdentity(); if (heartbeatTimer) clearInterval(heartbeatTimer); await releaseMainController(); throw error; }
 		cleanupStaleFiles();
 		for (const dir of [inboxDir, OUTBOX_DIR, ...(!SUBAGENT_TASK_ID && pendingScopeDir ? [pendingScopeDir] : [])]) {
 			try {
@@ -829,6 +1103,13 @@ export default function activate(pi: ExtensionAPI) {
 		await scheduleFlush();
 	});
 
+	pi.on("message_end", (event: any) => {
+		if (!receiverEnabled || event.message?.role !== "user") return;
+		// Pi emits message_end before appendMessage. Check on the next scan/tick,
+		// never acknowledge the event object (or unflushed in-memory entries).
+		setImmediate(() => { if (receiverEnabled) reconcileReceipts(); });
+	});
+
 	pi.on("agent_start", async () => {
 		if (!followUpOutstanding) return;
 		followUpOutstanding = false;
@@ -836,7 +1117,7 @@ export default function activate(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (!SUBAGENT_TASK_ID) return;
+		if (!SUBAGENT_TASK_ID || !receiverEnabled) return;
 		collectFiles();
 		if (pendingEvents.length && !followUpOutstanding) await flushBatch();
 		let lease = readWaitLease(true);
@@ -859,7 +1140,9 @@ export default function activate(pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("session_shutdown", (event: any) => {
+	pi.on("session_shutdown", async (event: any) => {
+		if (receiverEnabled) reconcileReceipts();
+		receiverEnabled = false;
 		for (const watcher of watchers) try { watcher.close(); } catch {}
 		watchers = [];
 		if (scanTimer) clearInterval(scanTimer);
@@ -884,6 +1167,9 @@ export default function activate(pi: ExtensionAPI) {
 		pendingScopeDir = "";
 		if (currentCtx?.hasUI) currentCtx.ui.setStatus("agent-notify", undefined);
 		currentCtx = null;
+		mainSessionFile = "";
+		inflight.clear();
+		await releaseMainController();
 	});
 }
 
