@@ -36,6 +36,12 @@ pi install git:github.com/roshameow/pi-subagent-durable
 
 其当前文档要求 Pi **0.80+**、Node.js **22+**；同时安装两个包时采用更严格的 Node 要求。保留 worker 的升级路径要求 **异步 RMUX worker**，以及实现 receiver ownership、`/agent:prepare-upgrade`、外部 bootstrap/keeper 和精确父会话恢复的配套 durable revision。仅支持基础委派/reload 的旧版本不具备此交接能力。包版本号本身不能证明这些能力；应核对安装源码及成功的准备报告。仅使用主会话通知不需要 durable、RMUX、私有仓库或个人配置。
 
+## 原生 MCP 兼容
+
+通知路由独立于 MCP 客户端。原生 Pi MCP/codemode 与旧 adapter 都可以提供 watcher 的 producer handle；本包不依赖 `pi-mcp-adapter`，不建立 MCP 连接，也不为每个 worker 启动服务。将精确 task/item/generation 与 producer marker 交给下述同一等待协议。传输重连或 `/reload` 不是外部任务已完成的证明。
+
+继续使用已有的 `notify_subagent`、`arm_notification_wait` 工具，或发现其当前 codemode identifier；不要将旧 `mcpScript` 的结果 envelope 套到原生调用。本节仅说明集成，不引入官方 Pi Durable，不改 lease 或 at-least-once receipt 口径。
+
 ## 主会话工具：普通 steering 与 watcher 交接
 
 主会话注册 `notify_subagent`：

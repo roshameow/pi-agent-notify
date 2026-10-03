@@ -36,6 +36,12 @@ pi install git:github.com/roshameow/pi-subagent-durable
 
 Its current documented requirements are Pi **0.80+** and Node.js **22+**; use the stricter Node requirement when installing both. The worker-preserving upgrade path requires **asynchronous RMUX workers** and a matching durable revision implementing receiver ownership, `/agent:prepare-upgrade`, the external bootstrap/keeper, and exact-parent-session recovery. Older releases with only basic delegation/reload do not provide this handoff. The package version number alone is not a capability check; verify the installed source and successful preparation report. Main-only notification delivery does not require durable, RMUX, a private repository or personal configuration.
 
+## Native MCP compatibility
+
+Notification routing is independent of the MCP client. Native Pi MCP/codemode and an older adapter can both supply watcher producer handles; this package does not require `pi-mcp-adapter`, create MCP connections, or start a service per worker. Pass the exact task/item/generation and producer marker to the same wait protocol below. A transport reconnect or `/reload` is not proof that an external job completed.
+
+Use the existing `notify_subagent` and `arm_notification_wait` tools directly, or discover their current codemode identifiers. Do not copy adapter-specific `mcpScript` result envelopes into the native tool path. These notes describe integration only; they do not add official Pi Durable, alter leases, or change the at-least-once receipt contract.
+
 ## Main-agent tool: steering vs. watcher handoff
 
 Main sessions register `notify_subagent`:
