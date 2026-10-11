@@ -62,12 +62,21 @@ try {
   let ended = false; const endPromise = emit("agent_end").then(() => { ended = true; });
   await new Promise(r => setTimeout(r, 80)); assert.equal(ended, false);
   const rawEvent = path.join(cwd, "quantnight-event.json");
-  fs.writeFileSync(rawEvent, JSON.stringify({ schemaVersion: 1, eventId: "evt-valid", producer: "quantnight-watcher", occurredAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), itemKey, target: { taskId }, eventType: "quantnight.mission.terminal", payload: { terminal: true } }));
+  // Empty raw message uses the existing sender's payload-JSON path, not a new envelope field.
+  const resultPayload = { terminal: true, resultsComplete: true, results: [{ alphaId: "alpha-fixture", sharpe: 2.1, fitness: 1.4, turnover: 0.12, margin: 0.0015, checks: [{ name: "LOW_SHARPE", result: "PASS", value: 2.1, limit: 1.58 }] }] };
+  fs.writeFileSync(rawEvent, JSON.stringify({ schemaVersion: 1, eventId: "evt-valid", producer: "quantnight-watcher", occurredAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), itemKey, target: { taskId }, eventType: "quantnight.mission.terminal", delivery: "result", carriesResults: true, message: "", payload: resultPayload }));
   const sender = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../scripts/notify_agent.py");
   const sentResult = spawnSync("python3", [sender, "send", "--event-file", rawEvent, "--lease-wait-seconds", "0"], { env: process.env, encoding: "utf8" });
   assert.equal(sentResult.status, 0, sentResult.stderr);
   await waitUntil(() => ended); await endPromise;
   assert.equal(sent.length, 1); assert.match(sent[0].text, /quantnight\.mission\.terminal/); assert.equal(sent[0].options.deliverAs, "followUp");
+  const resultPrefix = "quantnight.mission.terminal: ";
+  const resultLine = sent[0].text.split("\n").find(line => line.includes(resultPrefix));
+  assert.deepEqual(JSON.parse(resultLine.slice(resultLine.indexOf(resultPrefix) + resultPrefix.length)), resultPayload, "notification body must preserve the complete result JSON and metrics");
+  assert.ok(sent[0].text.includes(JSON.parse(sentResult.stdout).event.message), "sender message must reach Pi unchanged");
+  assert.match(sent[0].text, /Complete, unexpired result payloads may be used directly/);
+  assert.doesNotMatch(sent[0].text, /Re-read the authoritative state\/checkpoint before acting/);
+  assert.match(sent[0].text, /Delivery is at-least-once: make external effects idempotent by business\/event identity/);
   assert.equal(fs.existsSync(leasePath), false);
 
   // Preserve the mac-mini regression fix: if the event resumes a turn while
@@ -82,6 +91,8 @@ try {
   fs.writeFileSync(path.join(root, taskId, "evt-auto-wake.json"), JSON.stringify(event(arm.details, { eventId: "evt-auto-wake", sequence: 2, message: "auto-rearm wake", level: "green", state: "progress", actionable: false, terminal: false })));
   await waitUntil(() => autoEnded); await autoEndPromise;
   assert.equal(sent.length, 2); assert.match(sent[1].text, /auto-rearm wake/);
+  assert.match(sent[1].text, /For signals, partial\/expired results or ambiguity, re-query the authoritative state\/checkpoint/);
+  assert.match(sent[1].text, /a signal or terminal hint alone does not prove completion/);
   await emit("agent_start");
 
   // Replay is consumed/deduped and cannot inject twice.

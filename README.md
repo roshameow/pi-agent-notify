@@ -4,7 +4,7 @@
 
 Fail-closed external event → exact Pi session/worker delivery. Watchers publish a versioned event; the extension validates target identity, run nonce, item ownership, expiry, sequence and dedup state before injecting a user/follow-up message.
 
-Notifications are **wake-up hints, not authoritative proof**. After waking, re-query the source system. Delivery is **at-least-once**, not exactly-once execution: make external effects idempotent by business/event identity.
+Complete, unexpired result payloads in notifications may be used directly. **Signals or terminal hints alone are not proof of completion**; for signals, partial/expired results or ambiguity, re-query the source system. Delivery is **at-least-once**, not exactly-once execution: make external effects idempotent by business/event identity.
 
 ## Features
 
@@ -154,7 +154,7 @@ Then:
 3. Verify the producer PID is live and marker PID/item/target match.
 4. Call `arm_notification_wait` with `itemKey`, `reason`, a precise `wakeCondition`, `producerPid`, `producerMarkerPath`, bounded `leaseSeconds`, and optional `checkpointPath`. Marker/checkpoint paths must stay under worker cwd; repository-relative paths are recommended. The extension records `wakeCondition` but does not query the external system for you.
 5. Finish the current turn. Do not block a foreground tool with sleep/polling. The lease holds this process at `agent_end`.
-6. The watcher sends with `--require-lease`. A matching task/item/runId/nonce event consumes the lease and resumes the **same session**. On resume, re-query authoritative state before acting.
+6. The watcher sends with `--require-lease`. A matching task/item/runId/nonce event consumes the lease and resumes the **same session**. On resume, use complete, unexpired result payloads directly; re-query authoritative state for signals, partial/expired results or ambiguity.
 7. Normally explicitly arm the next wait. As a bounded safety net, if the original producer is still alive and the turn ends without re-arming, the extension restores that same released lease **once**, never beyond its original expiry. Dead-producer waits are not restored. A terminal hint alone does not suppress this safety net: complete/stop the producer after confirming authoritative terminal state.
 
 Lease location: `${PI_AGENT_NOTIFY_DIR:-/tmp/pi-agent-notify}/<taskId>/.notification-wait-lease`. Duration is **30 seconds–24 hours**, default **6 hours**. Missing/dead producer, marker/item mismatch, cwd escape, stale ownership/receiver heartbeat or wrong nonce causes refusal. Expiry queues a follow-up asking the worker to re-check state/checkpoint.
@@ -245,7 +245,7 @@ Each actionable user message carries a stable `[[agent-notify:<eventId>:<identit
 
 The extension journals inflight events **before** calling Pi, suppresses repeated queueing on scans and same-process reload, and retains outbox until the matching user-message bytes exist in the **exact session JSONL** and are fsynced. `message_end` only schedules a disk check: Pi may emit it **before** persisting the message. Passive green entries likewise need a persisted custom-entry receipt.
 
-On cold start, a persisted receipt completes ACK even if the old process crashed before saving dedup. Valid, unexpired, unacknowledged journal/outbox events can replay **at least once**. In-memory first-turn SessionManager entries are not durable receipts; ephemeral sessions cannot promise recovery. Ambiguous async queue failures can remain inflight until a controller restart. Receipt ACK proves transcript persistence, **not agent execution or business completion**. Query authoritative state and make side effects idempotent.
+On cold start, a persisted receipt completes ACK even if the old process crashed before saving dedup. Valid, unexpired, unacknowledged journal/outbox events can replay **at least once**. In-memory first-turn SessionManager entries are not durable receipts; ephemeral sessions cannot promise recovery. Ambiguous async queue failures can remain inflight until a controller restart. Receipt ACK proves transcript persistence, **not agent execution or business completion**. Complete, unexpired result payloads may be used directly; query authoritative state for signals, partial/expired results or ambiguity, and make side effects idempotent.
 
 ## Envelope v2 and levels
 

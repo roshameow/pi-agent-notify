@@ -4,7 +4,7 @@
 
 将外部事件以 **fail-closed（无法验证就拒绝）** 的方式投递到精确的 Pi 主会话或 worker。Watcher 发布带版本的事件；扩展在注入用户消息或 follow-up 前，校验目标身份、运行 nonce、事项所有权、有效期、序号及去重状态。
 
-通知只是 **唤醒提示，不是权威状态证明**。恢复后必须重新查询来源系统。投递采用 **at-least-once（至少一次）** 语义，不保证外部操作恰好执行一次；外部副作用必须按业务/事件身份实现幂等。
+通知中完整且未过期的结果 payload 可以直接采用。**信号或 terminal 提示本身不是完成证明**；信号、部分/过期结果或存在歧义时，须重新查询来源系统。投递采用 **at-least-once（至少一次）** 语义，不保证外部操作恰好执行一次；外部副作用必须按业务/事件身份实现幂等。
 
 ## 功能
 
@@ -154,7 +154,7 @@ itemKey: ci:run-42
 3. 验证 producer PID 存活，marker 的 PID/item/target 均匹配。
 4. 调用 `arm_notification_wait`，传入 `itemKey`、`reason`、精确的 `wakeCondition`、`producerPid`、`producerMarkerPath`、有界 `leaseSeconds` 和可选 `checkpointPath`。Marker/checkpoint 路径必须位于 worker cwd 内；推荐使用仓库相对路径。扩展记录 `wakeCondition`，不会代替你查询外部系统。
 5. 结束当前 turn。不要用 sleep/polling 阻塞前台工具。Lease 会在 `agent_end` 保持该进程存活。
-6. Watcher 使用 `--require-lease` 发送。匹配 task/item/runId/nonce 的事件消耗 lease，并恢复 **同一个会话**。恢复后先重新查询权威状态，再行动。
+6. Watcher 使用 `--require-lease` 发送。匹配 task/item/runId/nonce 的事件消耗 lease，并恢复 **同一个会话**。恢复后可直接采用完整且未过期的结果 payload；信号、部分/过期结果或存在歧义时，须回查权威状态。
 7. 通常应明确武装下一次 wait。作为有界安全网，若原 producer 仍存活、turn 结束时没有重新武装，扩展会 **仅一次** 恢复同一个已释放 lease，且不超过原有效期。Producer 已死则不恢复。仅有 terminal 提示不会关闭这个安全网：确认权威终态后，应完成/停止 producer。
 
 Lease 路径：`${PI_AGENT_NOTIFY_DIR:-/tmp/pi-agent-notify}/<taskId>/.notification-wait-lease`。时长为 **30 秒–24 小时**，默认 **6 小时**。Producer 缺失/死亡、marker/item 不匹配、cwd 越界、所有权/receiver heartbeat 陈旧或 nonce 错误都会导致拒绝。Lease 到期会排入 follow-up，要求 worker 重查状态/checkpoint。
@@ -245,7 +245,7 @@ Bootstrap 不加载 Pi，也不向业务 worker 发信号或 reload。它必须�
 
 扩展在调用 Pi **之前** 持久化 inflight journal，阻止反复扫描及同进程 reload 重复入队；只有匹配的用户消息字节已写入 **精确 session JSONL** 并完成 fsync，才确认并移除 outbox。`message_end` 仅安排磁盘检查：Pi 可能在消息持久化 **之前** 发出该事件。被动 green 条目同样需要持久化的 custom-entry receipt。
 
-Cold start 时，即使旧进程在保存 dedup 前崩溃，已有磁盘 receipt 也可完成 ACK。有效、未过期、未确认的 journal/outbox 事件可能 **至少一次** 重放。SessionManager 首轮内存条目不是持久 receipt；ephemeral session 无法承诺恢复。结果不明确的异步 queue failure 可能留在 inflight，直到 controller 重启。Receipt ACK 证明的是 transcript 持久化，**不是 agent 执行或业务完成**。重新查询权威状态，并让副作用幂等。
+Cold start 时，即使旧进程在保存 dedup 前崩溃，已有磁盘 receipt 也可完成 ACK。有效、未过期、未确认的 journal/outbox 事件可能 **至少一次** 重放。SessionManager 首轮内存条目不是持久 receipt；ephemeral session 无法承诺恢复。结果不明确的异步 queue failure 可能留在 inflight，直到 controller 重启。Receipt ACK 证明的是 transcript 持久化，**不是 agent 执行或业务完成**。完整且未过期的结果 payload 可以直接采用；信号、部分/过期结果或存在歧义时须查询权威状态，副作用仍须幂等。
 
 ## Envelope v2 与等级
 
