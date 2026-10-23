@@ -74,9 +74,11 @@ try {
   const resultLine = sent[0].text.split("\n").find(line => line.includes(resultPrefix));
   assert.deepEqual(JSON.parse(resultLine.slice(resultLine.indexOf(resultPrefix) + resultPrefix.length)), resultPayload, "notification body must preserve the complete result JSON and metrics");
   assert.ok(sent[0].text.includes(JSON.parse(sentResult.stdout).event.message), "sender message must reach Pi unchanged");
-  assert.match(sent[0].text, /Complete, unexpired result payloads may be used directly/);
+  assert.match(sent[0].text, /^\[agent-notify\]\n/);
+  assert.equal(sent[0].text.split("\n").length, 2, "one event must not append a repeated policy footer");
+  assert.equal(sent[0].text.split("\n").at(-1), resultLine, "the complete original event is the final line");
+  assert.doesNotMatch(sent[0].text, /External directed events were validated|Complete, unexpired result payloads|Delivery is at-least-once/);
   assert.doesNotMatch(sent[0].text, /Re-read the authoritative state\/checkpoint before acting/);
-  assert.match(sent[0].text, /Delivery is at-least-once: make external effects idempotent by business\/event identity/);
   assert.equal(fs.existsSync(leasePath), false);
 
   // Preserve the mac-mini regression fix: if the event resumes a turn while
@@ -91,8 +93,9 @@ try {
   fs.writeFileSync(path.join(root, taskId, "evt-auto-wake.json"), JSON.stringify(event(arm.details, { eventId: "evt-auto-wake", sequence: 2, message: "auto-rearm wake", level: "green", state: "progress", actionable: false, terminal: false })));
   await waitUntil(() => autoEnded); await autoEndPromise;
   assert.equal(sent.length, 2); assert.match(sent[1].text, /auto-rearm wake/);
-  assert.match(sent[1].text, /For signals, partial\/expired results or ambiguity, re-query the authoritative state\/checkpoint/);
-  assert.match(sent[1].text, /a signal or terminal hint alone does not prove completion/);
+  assert.equal(sent[1].text.split("\n").length, 2, "signal notifications must not append policy boilerplate either");
+  assert.ok(sent[1].text.endsWith("auto-rearm wake"), "the original signal message is preserved without a footer");
+  assert.doesNotMatch(sent[1].text, /For signals, partial\/expired results|a signal or terminal hint alone does not prove completion/);
   await emit("agent_start");
 
   // Replay is consumed/deduped and cannot inject twice.

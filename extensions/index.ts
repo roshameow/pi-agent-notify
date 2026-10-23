@@ -859,7 +859,7 @@ async function flushBatch(): Promise<void> {
 		log(`followUp outstanding; retained ${actionable.length} event(s)`);
 		return;
 	}
-	const body = `[agent-notify]\n${actionable.map(formatEvent).join("\n")}\n\nExternal directed events were validated. Complete, unexpired result payloads may be used directly. For signals, partial/expired results or ambiguity, re-query the authoritative state/checkpoint; a signal or terminal hint alone does not prove completion. Delivery is at-least-once: make external effects idempotent by business/event identity.`;
+	const body = `[agent-notify]\n${actionable.map(formatEvent).join("\n")}`;
 	try {
 		// Persist before calling the void host API. A new process replays this
 		// journal; same-process /reload preserves already queued work.
