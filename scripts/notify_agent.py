@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 import uuid
@@ -286,7 +287,128 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
     if target_kind == "worker" and not duplicate:
         # Non-consuming compatibility marker used by generic filesystem waiters.
         atomic_write(INBOX_ROOT / target_id / ".last-event", envelope)
-    return {"ok": True, "alreadySent": duplicate, "path": str(output) if output else None, "event": envelope}
+    result = {"ok": True, "alreadySent": duplicate, "path": str(output) if output else None, "event": envelope}
+    # Reuse this already-running producer, not a new timer/daemon. Foreign
+    # expired events otherwise remain in every receiver's hot scan forever.
+    # Publication succeeded before maintenance; cleanup errors must never turn
+    # an accepted event into an apparent send failure or invite a new event ID.
+    try:
+        result["maintenance"] = prune_expired(argparse.Namespace(apply=True, limit=1000))
+    except Exception as exc:
+        result["maintenance"] = {"ok": False, "errorType": type(exc).__name__, "error": str(exc)}
+    return result
+
+
+def _expired_snapshot(file: Path, cutoff: float) -> tuple[os.stat_result, dict[str, Any], bytes] | None:
+    """Inspect an immutable envelope without following links or trusting its age."""
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            return None
+        raw = os.read(fd, 65537)
+        if len(raw) != info.st_size:
+            return None
+        value = json.loads(raw)
+        if not isinstance(value, dict) or value.get("version") != 2:
+            return None
+        if value.get("targetKind") not in {"main", "worker"}:
+            return None
+        for key in ("eventId", "runId", "targetId"):
+            validate_key(value.get(key), key, SAFE_ID)
+        validate_key(value.get("itemKey"), "itemKey")
+        if (not isinstance(value.get("nonce"), str) or not 16 <= len(value["nonce"]) <= 200
+                or value.get("level") not in {"green", "yellow", "red"}
+                or not isinstance(value.get("message"), str) or not value["message"]
+                or not isinstance(value.get("source"), str) or not value["source"]
+                or not isinstance(value.get("state"), str) or not 1 <= len(value["state"]) <= 120
+                or not isinstance(value.get("sequence"), int) or isinstance(value["sequence"], bool)
+                or value["sequence"] < 0):
+            return None
+        expiry = value.get("expiresAt")
+        if not isinstance(expiry, str):
+            return None
+        parsed = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.timestamp() > cutoff:
+            return None
+        return info, value, raw
+    finally:
+        os.close(fd)
+
+
+def _file_fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def prune_expired(args: argparse.Namespace) -> dict[str, Any]:
+    """Bounded operator maintenance; quarantine explicit expiry, never ACK/delete."""
+    if not 1 <= args.limit <= 10000:
+        raise ValueError("limit must be between 1 and 10000")
+    result: dict[str, Any] = {"ok": True, "command": "prune-expired", "apply": args.apply,
+                             "examined": 0, "eligible": 0, "archived": 0, "skipped": 0,
+                             "errors": [], "archiveDirectory": None}
+    if not OUTBOX.exists():
+        return result
+    if OUTBOX.is_symlink() or not OUTBOX.is_dir():
+        raise ValueError("outbox must be a real directory")
+    cutoff = time.time()
+    candidates = []
+    with os.scandir(OUTBOX) as entries:
+        for entry in entries:
+            if result["examined"] >= args.limit:
+                break
+            if entry.name.startswith(".") or not entry.name.endswith(".json"):
+                continue
+            result["examined"] += 1
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    result["skipped"] += 1
+                    continue
+                snapshot = _expired_snapshot(Path(entry.path), cutoff)
+                if snapshot is None:
+                    result["skipped"] += 1
+                    continue
+                info, value, raw = snapshot
+                candidates.append((Path(entry.path), info, value, raw))
+            except (OSError, ValueError, TypeError):
+                result["skipped"] += 1
+    result["eligible"] = len(candidates)
+    if not args.apply or not candidates:
+        return result
+    archive = STATE_ROOT / "quarantine" / f"expired-{int(cutoff)}-{uuid.uuid4().hex}"
+    archive.mkdir(parents=True, mode=0o700)
+    manifest: dict[str, Any] = {"version": 1, "reason": "explicit_envelope_expiry", "cutoff": iso(cutoff),
+                                "acknowledged": False, "deleted": False, "files": []}
+    result["archiveDirectory"] = str(archive)
+    # Publication already uses this lock. Maintenance never resets sender history.
+    with (STATE_ROOT / "sender-state.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        atomic_write(archive / "manifest.json", manifest)
+        for file, info, value, raw in candidates:
+            try:
+                if _file_fingerprint(file.lstat()) != _file_fingerprint(info):
+                    result["skipped"] += 1
+                    continue
+                fresh = _expired_snapshot(file, cutoff)
+                if fresh is None or _file_fingerprint(fresh[0]) != _file_fingerprint(info) or fresh[2] != raw:
+                    result["skipped"] += 1
+                    continue
+                os.rename(file, archive / file.name)
+                manifest["files"].append({"name": file.name, "eventId": value["eventId"],
+                    "expiresAt": value["expiresAt"], "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
+                result["archived"] += 1
+            except FileNotFoundError:
+                result["skipped"] += 1  # A receiver may have consumed the immutable event.
+            except OSError as exc:
+                result["errors"].append({"name": file.name, "error": str(exc)})
+        # Sync the batch directory changes before publishing the final receipt.
+        for directory in (OUTBOX, archive):
+            fd = os.open(directory, os.O_RDONLY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+        atomic_write(archive / "manifest.json", manifest)
+    result["ok"] = not result["errors"]
+    return result
 
 
 def parser() -> argparse.ArgumentParser:
@@ -300,18 +422,25 @@ def parser() -> argparse.ArgumentParser:
     send_p.add_argument("--source", default="script"); send_p.add_argument("--ttl", type=int, default=3600)
     send_p.add_argument("--require-lease", action="store_true", help="Require an armed durable wait lease (watcher handoff)")
     send_p.add_argument("--lease-wait-seconds", type=int, default=60)
+    prune_p = sub.add_parser("prune-expired", help="Quarantine explicitly expired v2 outbox envelopes; default is read-only")
+    mode = prune_p.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--dry-run", action="store_false", dest="apply")
+    prune_p.set_defaults(apply=False)
+    prune_p.add_argument("--limit", type=int, default=1000)
     return p
 
 
 def main() -> int:
     argv = sys.argv[1:]
     # Backward compatible invocation: notify_agent.py "message" --item ...
-    if argv and argv[0] != "send": argv.insert(0, "send")
+    if argv and argv[0] not in {"send", "prune-expired"}: argv.insert(0, "send")
     args = parser().parse_args(argv)
-    if args.command != "send":
-        raise SystemExit("usage: notify_agent.py send [message] --item KEY [--to TASK]")
+    if args.command not in {"send", "prune-expired"}:
+        raise SystemExit("usage: notify_agent.py send ... | prune-expired [--dry-run|--apply]")
     try:
-        print(json.dumps(send(args), ensure_ascii=False)); return 0
+        result = send(args) if args.command == "send" else prune_expired(args)
+        print(json.dumps(result, ensure_ascii=False)); return 0 if result.get("ok") else 1
     except Exception as exc:
         print(json.dumps({"ok": False, "errorType": type(exc).__name__, "error": str(exc)}), file=sys.stderr); return 1
 
